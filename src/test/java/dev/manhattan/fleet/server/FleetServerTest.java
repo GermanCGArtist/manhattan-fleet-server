@@ -23,6 +23,7 @@ public final class FleetServerTest {
         testPersistenceRoundTrip();
         testSleepCoordinatorNearestAndFailover();
         testChestCoordinatorLocksAndSync();
+        testTaskOrderAndTopDownYBandGating();
         System.out.println("FleetServerTest: ALL " + passed + " tests passed.");
     }
 
@@ -269,6 +270,37 @@ public final class FleetServerTest {
         // After TTL expires, Bot2 acquires lock.
         ChestCoordinator.LockResult l3 = cc.tryLock("minecraft:overworld", 10, 64, 20, "u2", "Bot2", 30_000L, 35_000L);
         assertTrue(l3.granted(), "Bot2 should acquire lock after TTL expiry");
+        passed++;
+    }
+
+    private static void testTaskOrderAndTopDownYBandGating() {
+        AtomicLong clock = new AtomicLong(7_000_000L);
+        FleetManager fm = new FleetManager(new FleetConfig(), clock::get);
+        fm.registerBot("u1", "Bot1", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 0, 64, 0);
+
+        AssignmentPolicy p = new AssignmentPolicy();
+        p.maxBots = 2;
+        p.maxDistance = 0;
+
+        // Step 1 is fill_water (further away at x=100), Step 2 is clear_area with 2 Y-bands (closer at x=0).
+        // Even though Step 2 is closer, Step 1 must finish first; then Step 2 must dig y=64 before y=48!
+        List<ChunkSpec> chunks = List.of(
+                new ChunkSpec("fill_water/100,0", 3, 0, 100, 0),
+                new ChunkSpec("clear_area/0,0,48", 0, 0, 0, 0),  // bottom band listed first intentionally
+                new ChunkSpec("clear_area/0,0,64", 0, 0, 0, 0)   // top band
+        );
+        fm.submitJob("p1", "Layered", "{}", "minecraft:overworld", p, chunks, List.of(), "Admin");
+
+        WorkGrant g1 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null);
+        assertTrue("fill_water/100,0".equals(g1.chunkKey), "Step 1 must run before Step 2 even if further away");
+        fm.reportChunk("u1", g1.jobId, g1.chunkKey, ChunkState.DONE, "");
+
+        WorkGrant g2 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
+        assertTrue("clear_area/0,0,64".equals(g2.chunkKey), "Top Y-band (64) must be leased before bottom Y-band (48)");
+        fm.reportChunk("u1", g2.jobId, g2.chunkKey, ChunkState.DONE, "");
+
+        WorkGrant g3 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
+        assertTrue("clear_area/0,0,48".equals(g3.chunkKey), "Bottom Y-band (48) unlocks after top band is DONE");
         passed++;
     }
 

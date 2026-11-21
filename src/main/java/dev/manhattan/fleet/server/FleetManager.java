@@ -471,18 +471,43 @@ public final class FleetManager {
         int maxDist = job.assignment.mode == AssignmentMode.AUTO_POOL ? job.assignment.maxDistance : 0;
         double maxDistSq = maxDist > 0 ? (double) maxDist * maxDist : Double.MAX_VALUE;
 
+        // 1. Task-order gating: only hand out chunks from the earliest taskId that still has unfinished chunks.
+        String activeTaskId = null;
+        for (ChunkEntry ce : job.chunks.values()) {
+            if (ce.state != ChunkState.DONE && ce.state != ChunkState.FAILED) {
+                activeTaskId = taskIdOf(ce.chunkKey);
+                break;
+            }
+        }
+        if (activeTaskId == null) return null;
+
+        // 2. Top-down Y-band gating: find highest unfinished Y-band per (taskId, x, z) column.
+        Map<String, Integer> highestUnfinishedY = new HashMap<>();
+        for (ChunkEntry ce : job.chunks.values()) {
+            if (ce.state == ChunkState.DONE || ce.state == ChunkState.FAILED) continue;
+            if (!activeTaskId.equals(taskIdOf(ce.chunkKey))) continue;
+            Integer y = parseBandY(ce.chunkKey);
+            if (y != null) {
+                String colKey = columnKeyOf(ce.chunkKey);
+                highestUnfinishedY.merge(colKey, y, Math::max);
+            }
+        }
+
         List<ChunkEntry> activeOthers = new ArrayList<>();
         List<ChunkEntry> available = new ArrayList<>();
         List<ChunkEntry> gracePreemptable = new ArrayList<>();
 
         for (ChunkEntry ce : job.chunks.values()) {
+            if (!activeTaskId.equals(taskIdOf(ce.chunkKey))) continue;
             if (ce.state == ChunkState.CLAIMED && !bot.uuid.equals(ce.ownerUuid)) {
                 activeOthers.add(ce);
             } else if (ce.state == ChunkState.PENDING || ce.state == ChunkState.DEFERRED) {
+                if (!isTopUnfinishedBand(ce.chunkKey, highestUnfinishedY)) continue;
                 if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) <= maxDistSq) {
                     available.add(ce);
                 }
             } else if (ce.state == ChunkState.DISCONNECTED_GRACE && !bot.uuid.equals(ce.ownerUuid)) {
+                if (!isTopUnfinishedBand(ce.chunkKey, highestUnfinishedY)) continue;
                 if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) <= maxDistSq) {
                     gracePreemptable.add(ce);
                 }
@@ -599,6 +624,45 @@ public final class FleetManager {
         }
         job.status = JobStatus.DONE;
         dirty = true;
+    }
+
+    private static String taskIdOf(String chunkKey) {
+        if (chunkKey == null) return "";
+        int slash = chunkKey.indexOf('/');
+        return slash >= 0 ? chunkKey.substring(0, slash) : "";
+    }
+
+    private static Integer parseBandY(String chunkKey) {
+        if (chunkKey == null) return null;
+        int slash = chunkKey.indexOf('/');
+        String coords = slash >= 0 ? chunkKey.substring(slash + 1) : chunkKey;
+        int c1 = coords.indexOf(',');
+        if (c1 < 0) return null;
+        int c2 = coords.indexOf(',', c1 + 1);
+        if (c2 < 0) return null;
+        try {
+            return Integer.parseInt(coords.substring(c2 + 1).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static String columnKeyOf(String chunkKey) {
+        if (chunkKey == null) return "";
+        int slash = chunkKey.indexOf('/');
+        String prefix = slash >= 0 ? chunkKey.substring(0, slash + 1) : "";
+        String coords = slash >= 0 ? chunkKey.substring(slash + 1) : chunkKey;
+        int c1 = coords.indexOf(',');
+        if (c1 < 0) return chunkKey;
+        int c2 = coords.indexOf(',', c1 + 1);
+        return c2 < 0 ? chunkKey : prefix + coords.substring(0, c2);
+    }
+
+    private static boolean isTopUnfinishedBand(String chunkKey, Map<String, Integer> highestUnfinishedY) {
+        Integer y = parseBandY(chunkKey);
+        if (y == null) return true;
+        Integer topY = highestUnfinishedY.get(columnKeyOf(chunkKey));
+        return topY == null || y >= topY;
     }
 
     private static boolean isWithinSpatialBuffer(ChunkEntry candidate, List<ChunkEntry> activeOthers, int buffer) {
