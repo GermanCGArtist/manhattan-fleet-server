@@ -1,6 +1,6 @@
 # Manhattan Fleet Server
 
-A lean, coordination-only server-side Fabric companion mod for [Manhattan](https://github.com/GermanCGArtist/Manhattan) multi-bot fleets on Minecraft 26.1.1 (Java 25).
+A lean, coordination-only server-side Fabric companion mod for [Manhattan](https://github.com/GermanCGArtist/Manhattan) multi-bot fleets on Minecraft 26.3 (Java 25).
 
 ## Features
 
