@@ -1,0 +1,47 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // MC 26.1+ is unobfuscated: no mappings, plain implementation instead of modImplementation
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+    def version = project.version
+    inputs.property "version", version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 25
+    options.compilerArgs += ['-Xlint:unchecked']
+}
+
+// Offline pure-Java unit tests for FleetManager, SleepCoordinator, ChestCoordinator, and FleetStore.
+tasks.register('fleetTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs offline unit tests for Manhattan Fleet Server coordination logic.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.manhattan.fleet.server.FleetServerTest'
+}
+
+tasks.named('test') {
+    enabled = false
+}
+
+tasks.named('check') {
+    dependsOn 'fleetTest'
+}

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "manhattan-fleet-server",
+  "version": "${version}",
+  "name": "Manhattan Fleet Server",
+  "description": "Lean server-side Fabric coordinator for multi-bot Manhattan fleets: project job queues, lease-based chunk claiming with rejoin grace, coordinated 1-player sleeping, and shared chest locks.",
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "dev.manhattan.fleet.server.FleetServerMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "fabric-api": "*",
+    "minecraft": "~26.1.1",
+    "java": ">=25"
+  }
+}
