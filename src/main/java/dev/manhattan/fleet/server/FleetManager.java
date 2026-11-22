@@ -490,15 +490,25 @@ public final class FleetManager {
         }
         if (activeTaskId == null) return null;
 
-        // 2. Global top-down Y-band gating: clear the highest unfinished Y-band across the entire task
-        //    before unlocking the next layer down (matches solo ChunkGrid layer-by-layer excavation).
-        Integer highestUnfinishedY = null;
+        // 2. Global top-down Y-band gating with 1-layer lookahead:
+        //    Clear the highest unfinished Y-band (topBandY) across the entire task first.
+        //    If no claimable chunks remain on topBandY (e.g. peers hold the last chunk(s)), allow an idle
+        //    bot to start at most 1 layer down (nextBandY) on columns whose topBandY chunk is already finished.
+        Integer topBandY = null;
+        Integer nextBandY = null;
+        Map<String, Integer> highestUnfinishedByCol = new HashMap<>();
         for (ChunkEntry ce : job.chunks.values()) {
             if (ce.state == ChunkState.DONE || ce.state == ChunkState.FAILED) continue;
             if (!activeTaskId.equals(taskIdOf(ce.chunkKey))) continue;
             Integer y = parseBandY(ce.chunkKey);
-            if (y != null && (highestUnfinishedY == null || y > highestUnfinishedY)) {
-                highestUnfinishedY = y;
+            if (y != null) {
+                highestUnfinishedByCol.merge(columnKeyOf(ce.chunkKey), y, Math::max);
+                if (topBandY == null || y > topBandY) {
+                    if (topBandY != null) nextBandY = topBandY;
+                    topBandY = y;
+                } else if (y < topBandY && (nextBandY == null || y > nextBandY)) {
+                    nextBandY = y;
+                }
             }
         }
 
@@ -506,24 +516,30 @@ public final class FleetManager {
         List<ChunkEntry> availablePending = new ArrayList<>();
         List<ChunkEntry> availableDeferred = new ArrayList<>();
         List<ChunkEntry> gracePreemptable = new ArrayList<>();
+        List<ChunkEntry> lookaheadPending = new ArrayList<>();
+        List<ChunkEntry> lookaheadDeferred = new ArrayList<>();
 
         for (ChunkEntry ce : job.chunks.values()) {
             if (!activeTaskId.equals(taskIdOf(ce.chunkKey))) continue;
             if (ce.state == ChunkState.CLAIMED && !bot.uuid.equals(ce.ownerUuid)) {
                 activeOthers.add(ce);
             } else if (ce.state == ChunkState.PENDING) {
-                if (!isTopUnfinishedBand(ce.chunkKey, highestUnfinishedY)) continue;
-                if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) <= maxDistSq) {
+                if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) > maxDistSq) continue;
+                if (isTopUnfinishedBand(ce.chunkKey, topBandY)) {
                     availablePending.add(ce);
+                } else if (isEligibleLookaheadBand(ce.chunkKey, nextBandY, highestUnfinishedByCol)) {
+                    lookaheadPending.add(ce);
                 }
             } else if (ce.state == ChunkState.DEFERRED) {
                 if (ce.tries >= config.maxChunkRetries || nowMs < ce.nextRetryAtMs) continue;
-                if (!isTopUnfinishedBand(ce.chunkKey, highestUnfinishedY)) continue;
-                if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) <= maxDistSq) {
+                if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) > maxDistSq) continue;
+                if (isTopUnfinishedBand(ce.chunkKey, topBandY)) {
                     availableDeferred.add(ce);
+                } else if (isEligibleLookaheadBand(ce.chunkKey, nextBandY, highestUnfinishedByCol)) {
+                    lookaheadDeferred.add(ce);
                 }
             } else if (ce.state == ChunkState.DISCONNECTED_GRACE && !bot.uuid.equals(ce.ownerUuid)) {
-                if (!isTopUnfinishedBand(ce.chunkKey, highestUnfinishedY)) continue;
+                if (!isTopUnfinishedBand(ce.chunkKey, topBandY)) continue;
                 if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) <= maxDistSq) {
                     gracePreemptable.add(ce);
                 }
@@ -532,15 +548,15 @@ public final class FleetManager {
 
         int buffer = config.spatialBufferChunks;
 
-        // Pass 1 & 2: Fresh PENDING chunks always take priority over DEFERRED retries.
+        // Pass 1 & 2: Fresh PENDING chunks on topBandY always take priority.
         ChunkEntry picked = pickNearest(bot, availablePending, activeOthers, buffer);
         if (picked != null) return picked;
 
-        // Pass 3 & 4: Retry DEFERRED chunks only after all PENDING chunks in this layer are claimed/done.
+        // Pass 3 & 4: Retry DEFERRED chunks on topBandY.
         picked = pickNearest(bot, availableDeferred, activeOthers, buffer);
         if (picked != null) return picked;
 
-        // Pass 5: If no normal chunks remain, preempt a DISCONNECTED_GRACE chunk so idle bots finish the job.
+        // Pass 5: Preempt a DISCONNECTED_GRACE chunk on topBandY before looking ahead.
         ChunkEntry bestGrace = null;
         double bestGraceDist = Double.MAX_VALUE;
         for (ChunkEntry ce : gracePreemptable) {
@@ -550,7 +566,12 @@ public final class FleetManager {
                 bestGrace = ce;
             }
         }
-        return bestGrace;
+        if (bestGrace != null) return bestGrace;
+
+        // Pass 6 & 7: 1-layer lookahead on nextBandY when topBandY has no claimable chunks left.
+        picked = pickNearest(bot, lookaheadPending, activeOthers, buffer);
+        if (picked != null) return picked;
+        return pickNearest(bot, lookaheadDeferred, activeOthers, buffer);
     }
 
     private static ChunkEntry pickNearest(BotRecord bot, List<ChunkEntry> candidates,
@@ -676,10 +697,30 @@ public final class FleetManager {
         }
     }
 
+    private static String columnKeyOf(String chunkKey) {
+        if (chunkKey == null) return "";
+        int slash = chunkKey.indexOf('/');
+        String prefix = slash >= 0 ? chunkKey.substring(0, slash + 1) : "";
+        String coords = slash >= 0 ? chunkKey.substring(slash + 1) : chunkKey;
+        int c1 = coords.indexOf(',');
+        if (c1 < 0) return chunkKey;
+        int c2 = coords.indexOf(',', c1 + 1);
+        return c2 < 0 ? chunkKey : prefix + coords.substring(0, c2);
+    }
+
     private static boolean isTopUnfinishedBand(String chunkKey, Integer highestUnfinishedY) {
         if (highestUnfinishedY == null) return true;
         Integer y = parseBandY(chunkKey);
         return y == null || y >= highestUnfinishedY;
+    }
+
+    private static boolean isEligibleLookaheadBand(String chunkKey, Integer nextBandY,
+                                                   Map<String, Integer> highestUnfinishedByCol) {
+        if (nextBandY == null) return false;
+        Integer y = parseBandY(chunkKey);
+        if (y == null || !y.equals(nextBandY)) return false;
+        Integer colTop = highestUnfinishedByCol.get(columnKeyOf(chunkKey));
+        return colTop == null || y >= colTop;
     }
 
     private static boolean isWithinSpatialBuffer(ChunkEntry candidate, List<ChunkEntry> activeOthers, int buffer) {

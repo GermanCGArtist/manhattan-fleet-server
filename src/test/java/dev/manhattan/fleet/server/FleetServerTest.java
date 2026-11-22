@@ -25,6 +25,7 @@ public final class FleetServerTest {
         testChestCoordinatorLocksAndSync();
         testTaskOrderAndTopDownYBandGating();
         testDeferredPriorityCooldownAndMaxRetries();
+        testOneLayerLookaheadWhenTopBandClaimed();
         System.out.println("FleetServerTest: ALL " + passed + " tests passed.");
     }
 
@@ -365,6 +366,48 @@ public final class FleetServerTest {
         WorkGrant g5 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
         assertTrue("clear/0,0,48".equals(g5.chunkKey),
                 "Lower Y-band must unlock once stuck top-band chunk reaches max retries");
+        passed++;
+    }
+
+    private static void testOneLayerLookaheadWhenTopBandClaimed() {
+        AtomicLong clock = new AtomicLong(9_000_000L);
+        FleetManager fm = new FleetManager(new FleetConfig(), clock::get);
+        fm.registerBot("u1", "Bot1", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 0, 64, 0);
+        fm.registerBot("u2", "Bot2", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 64, 64, 0);
+
+        AssignmentPolicy p = new AssignmentPolicy();
+        p.maxBots = 2;
+        p.maxDistance = 0;
+
+        // 2 columns x 3 Y-bands (64, 48, 32).
+        List<ChunkSpec> chunks = List.of(
+                new ChunkSpec("clear/0,0,64", 0, 0, 0, 0),
+                new ChunkSpec("clear/0,0,48", 0, 0, 0, 0),
+                new ChunkSpec("clear/0,0,32", 0, 0, 0, 0),
+                new ChunkSpec("clear/64,0,64", 2, 0, 64, 0),
+                new ChunkSpec("clear/64,0,48", 2, 0, 64, 0),
+                new ChunkSpec("clear/64,0,32", 2, 0, 64, 0)
+        );
+        FleetJob job = fm.submitJob("p1", "Lookahead", "{}", "minecraft:overworld", p, chunks, List.of(), "Admin");
+
+        // Both bots take top Y-band (64).
+        WorkGrant b1 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null);
+        WorkGrant b2 = fm.claimWork("u2", "minecraft:overworld", 64, 64, 0, null);
+        assertTrue("clear/0,0,64".equals(b1.chunkKey), "Bot1 takes col A y=64");
+        assertTrue("clear/64,0,64".equals(b2.chunkKey), "Bot2 takes col B y=64");
+
+        // Bot1 finishes col A y=64 while Bot2 is still working on col B y=64.
+        fm.reportChunk("u1", job.jobId, b1.chunkKey, ChunkState.DONE, "");
+
+        // 1-layer lookahead: Bot1 immediately gets col A y=48 (its column above is DONE), NOT col B y=48!
+        WorkGrant b1Next = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, b1.projectHash);
+        assertTrue(!b1Next.idle && "clear/0,0,48".equals(b1Next.chunkKey),
+                "Bot1 should look ahead 1 layer to clear/0,0,48, got " + b1Next.chunkKey);
+
+        // If Bot1 finishes col A y=48 while Bot2 is STILL on col B y=64, Bot1 must NOT drop 2 layers to y=32!
+        fm.reportChunk("u1", job.jobId, b1Next.chunkKey, ChunkState.DONE, "");
+        WorkGrant b1Wait = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, b1.projectHash);
+        assertTrue(b1Wait.idle, "Bot1 must not drop 2 layers ahead (y=32) while y=64 is still unfinished");
         passed++;
     }
 
