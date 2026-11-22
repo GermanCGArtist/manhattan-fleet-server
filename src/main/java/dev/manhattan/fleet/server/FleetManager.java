@@ -263,22 +263,118 @@ public final class FleetManager {
     }
 
     public boolean cancelJob(String jobId) {
+        return !cancelJobAndListWorkers(jobId).isEmpty()
+                || (jobs.get(jobId) != null && jobs.get(jobId).status == JobStatus.CANCELLED);
+    }
+
+    /** Cancels a job, releases its leases, and returns UUIDs of workers that were actively running it. */
+    public List<String> cancelJobAndListWorkers(String jobId) {
         FleetJob job = jobs.get(jobId);
-        if (job == null || job.status == JobStatus.CANCELLED) return false;
+        if (job == null || job.status == JobStatus.CANCELLED) return List.of();
+        Set<String> affected = new LinkedHashSet<>();
         job.status = JobStatus.CANCELLED;
         for (ChunkEntry ce : job.chunks.values()) {
             if (ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE) {
+                if (ce.ownerUuid != null) affected.add(ce.ownerUuid);
                 clearChunkOwner(ce, ChunkState.PENDING);
             }
         }
         for (BotRecord bot : bots.values()) {
             if (jobId.equals(bot.activeJobId)) {
+                affected.add(bot.uuid);
                 bot.activeJobId = null;
                 bot.activeChunkKey = null;
+                if (!bot.held) bot.phase = "IDLE";
+            }
+        }
+        dirty = true;
+        return new ArrayList<>(affected);
+    }
+
+    /** Cancels all ACTIVE/PAUSED jobs and returns UUIDs of all affected workers. */
+    public List<String> cancelAllJobs() {
+        Set<String> affected = new LinkedHashSet<>();
+        for (FleetJob job : jobs.values()) {
+            if (job.status == JobStatus.ACTIVE || job.status == JobStatus.PAUSED) {
+                affected.addAll(cancelJobAndListWorkers(job.jobId));
+            }
+        }
+        return new ArrayList<>(affected);
+    }
+
+    /** Removes all DONE and CANCELLED jobs from the server queue. */
+    public int clearFinishedJobs() {
+        int removed = 0;
+        Iterator<Map.Entry<String, FleetJob>> it = jobs.entrySet().iterator();
+        while (it.hasNext()) {
+            JobStatus st = it.next().getValue().status;
+            if (st == JobStatus.DONE || st == JobStatus.CANCELLED) {
+                it.remove();
+                removed++;
+            }
+        }
+        if (removed > 0) dirty = true;
+        return removed;
+    }
+
+    /** Releases a worker's active chunk lease and optionally holds it idle until resumed or reassigned. */
+    public boolean stopWorker(String botUuid, boolean hold) {
+        BotRecord bot = bots.get(botUuid);
+        if (bot == null) return false;
+        releaseAllChunksForBot(botUuid);
+        bot.activeJobId = null;
+        bot.activeChunkKey = null;
+        bot.held = hold;
+        bot.phase = hold ? "HELD" : "IDLE";
+        dirty = true;
+        return true;
+    }
+
+    /** Releases a held worker back into the active pool. */
+    public boolean resumeWorker(String botUuid) {
+        BotRecord bot = bots.get(botUuid);
+        if (bot == null) return false;
+        bot.held = false;
+        if ("HELD".equals(bot.phase)) bot.phase = "IDLE";
+        dirty = true;
+        return true;
+    }
+
+    /** Releases a worker's current chunk and steers it immediately onto {@code targetJobId}. */
+    public boolean reassignWorker(String botUuid, String targetJobId) {
+        BotRecord bot = bots.get(botUuid);
+        FleetJob target = jobs.get(targetJobId);
+        if (bot == null || target == null || target.status != JobStatus.ACTIVE) return false;
+        releaseAllChunksForBot(botUuid);
+        bot.held = false;
+        bot.activeChunkKey = null;
+        bot.activeJobId = targetJobId;
+        bot.phase = "IDLE";
+        if (target.assignment.mode == AssignmentMode.EXPLICIT) {
+            boolean listed = false;
+            for (String s : target.assignment.explicitBots) {
+                if (s != null && (s.equalsIgnoreCase(bot.name) || s.equalsIgnoreCase(bot.uuid))) {
+                    listed = true;
+                    break;
+                }
+            }
+            if (!listed && bot.name != null && !bot.name.isBlank()) {
+                target.assignment.explicitBots.add(bot.name);
             }
         }
         dirty = true;
         return true;
+    }
+
+    private void releaseAllChunksForBot(String botUuid) {
+        for (FleetJob job : jobs.values()) {
+            for (ChunkEntry ce : job.chunks.values()) {
+                if ((ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE)
+                        && botUuid.equals(ce.ownerUuid)) {
+                    clearChunkOwner(ce, ChunkState.PENDING);
+                }
+            }
+        }
     }
 
     public boolean updateAssignment(String jobId, AssignmentPolicy policy) {
@@ -299,6 +395,10 @@ public final class FleetManager {
         BotRecord bot = bots.get(botUuid);
         if (bot == null || !bot.online) return WorkGrant.idle();
         if (bot.mode != ClientMode.WORKER && bot.mode != ClientMode.BOTH) return WorkGrant.idle();
+        if (bot.held) {
+            bot.phase = "HELD";
+            return WorkGrant.idle();
+        }
 
         bot.dimension = dimension != null ? dimension : bot.dimension;
         bot.x = x;

@@ -27,6 +27,7 @@ public final class FleetServerTest {
         testDeferredPriorityCooldownAndMaxRetries();
         testOneLayerLookaheadWhenTopBandClaimed();
         testPhaseSpilloverAndExplicitBarriers();
+        testWorkerStopHoldReassignAndJobCancel();
         System.out.println("FleetServerTest: ALL " + passed + " tests passed.");
     }
 
@@ -459,6 +460,44 @@ public final class FleetServerTest {
         fm.reportChunk("u1", job.jobId, c1.chunkKey, ChunkState.DONE, "");
         WorkGrant c3 = fm.claimWork("u2", "minecraft:overworld", 128, 64, 0, c2.projectHash);
         assertTrue("clear_3/128,0,64".equals(c3.chunkKey), "clear_3 unlocks once clear_1 finishes");
+        passed++;
+    }
+
+    private static void testWorkerStopHoldReassignAndJobCancel() {
+        AtomicLong clock = new AtomicLong(11_000_000L);
+        FleetManager fm = new FleetManager(new FleetConfig(), clock::get);
+        fm.registerBot("u1", "Bot1", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 0, 64, 0);
+        fm.registerBot("u2", "Bot2", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 32, 64, 0);
+
+        AssignmentPolicy p = new AssignmentPolicy();
+        p.maxBots = 2;
+        p.maxDistance = 0;
+
+        FleetJob j1 = fm.submitJob("p1", "Job1", "{}", "minecraft:overworld", p, List.of(
+                new ChunkSpec("c1/0,0", 0, 0, 0, 0),
+                new ChunkSpec("c1/32,0", 1, 0, 32, 0)
+        ), List.of(), "Admin");
+        FleetJob j2 = fm.submitJob("p2", "Job2", "{}", "minecraft:overworld", p, List.of(
+                new ChunkSpec("c2/0,0", 0, 0, 0, 0)
+        ), List.of(), "Admin");
+
+        WorkGrant g1 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null);
+        assertTrue(j1.jobId.equals(g1.jobId), "Bot1 starts on Job1");
+
+        // Stop & hold Bot1 -> releases its chunk back to PENDING and keeps Bot1 idle.
+        assertTrue(fm.stopWorker("u1", true), "stopWorker should succeed");
+        assertTrue(j1.chunks.get(g1.chunkKey).state == ChunkState.PENDING, "Released chunk must return to PENDING");
+        assertTrue(fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null).idle, "Held worker must stay idle");
+
+        // Reassign Bot1 directly to Job2 -> unholds and claims Job2!
+        assertTrue(fm.reassignWorker("u1", j2.jobId), "reassignWorker should succeed");
+        WorkGrant g2 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null);
+        assertTrue(!g2.idle && j2.jobId.equals(g2.jobId), "Reassigned worker must claim from Job2");
+
+        // Cancel all jobs -> returns u1 as affected, marks both CANCELLED, clearFinishedJobs removes them.
+        List<String> affected = fm.cancelAllJobs();
+        assertTrue(affected.contains("u1"), "cancelAllJobs must report active worker u1");
+        assertTrue(fm.clearFinishedJobs() == 2, "clearFinishedJobs must remove both cancelled jobs");
         passed++;
     }
 

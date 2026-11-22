@@ -206,11 +206,53 @@ public final class FleetServerMod implements ModInitializer {
                 switch (action.toLowerCase()) {
                     case "pause" -> manager.pauseJob(jobId);
                     case "resume" -> manager.resumeJob(jobId);
-                    case "cancel" -> manager.cancelJob(jobId);
+                    case "cancel" -> {
+                        List<String> affected = manager.cancelJobAndListWorkers(jobId);
+                        for (String botUuid : affected) {
+                            sendWorkerStop(server, botUuid, jobId, "Job " + jobId + " cancelled by " + name);
+                        }
+                    }
+                    case "cancel_all" -> {
+                        List<String> affected = manager.cancelAllJobs();
+                        for (String botUuid : affected) {
+                            sendWorkerStop(server, botUuid, "", "All fleet jobs cancelled by " + name);
+                        }
+                    }
+                    case "clear_finished" -> manager.clearFinishedJobs();
                     case "reassign" -> {
                         if (body.has("assignment")) {
                             AssignmentPolicy p = GSON.fromJson(body.get("assignment"), AssignmentPolicy.class);
                             manager.updateAssignment(jobId, p);
+                        }
+                    }
+                    default -> {}
+                }
+                broadcastSnapshot(server);
+            }
+
+            case "worker_control" -> {
+                if (!isEditorAllowed(player)) {
+                    sendError(player, "Not authorized as Fleet Editor.");
+                    return;
+                }
+                String botUuid = getStr(body, "botUuid", "");
+                String action = getStr(body, "action", "");
+                String targetJobId = getStr(body, "targetJobId", "");
+                switch (action.toLowerCase()) {
+                    case "stop" -> {
+                        if (manager.stopWorker(botUuid, true)) {
+                            sendWorkerStop(server, botUuid, "", "Stopped & held by " + name);
+                        }
+                    }
+                    case "release" -> {
+                        if (manager.stopWorker(botUuid, false)) {
+                            sendWorkerStop(server, botUuid, "", "Chunk released by " + name);
+                        }
+                    }
+                    case "resume" -> manager.resumeWorker(botUuid);
+                    case "reassign" -> {
+                        if (manager.reassignWorker(botUuid, targetJobId)) {
+                            sendWorkerStop(server, botUuid, "", "Reassigned to " + targetJobId + " by " + name);
                         }
                     }
                     default -> {}
@@ -304,6 +346,20 @@ public final class FleetServerMod implements ModInitializer {
         }
         return player.permissions().hasPermission(new net.minecraft.server.permissions.Permission.HasCommandLevel(
                 net.minecraft.server.permissions.PermissionLevel.GAMEMASTERS));
+    }
+
+    private void sendWorkerStop(MinecraftServer server, String botUuid, String jobId, String reason) {
+        if (botUuid == null || botUuid.isBlank()) return;
+        try {
+            ServerPlayer target = server.getPlayerList().getPlayer(UUID.fromString(botUuid));
+            if (target == null) return;
+            JsonObject body = new JsonObject();
+            body.addProperty("action", "stop");
+            body.addProperty("jobId", jobId != null ? jobId : "");
+            body.addProperty("reason", reason != null ? reason : "Stopped by Fleet Editor");
+            send(target, "worker_command", body);
+        } catch (IllegalArgumentException ignored) {
+        }
     }
 
     private void sendSleepOrder(MinecraftServer server, SleepCoordinator.SleepOrder order) {

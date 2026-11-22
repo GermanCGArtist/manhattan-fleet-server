@@ -150,6 +150,7 @@ public final class FleetModels {
         public int food = 20;
         public int freeSlots = 36;
         public boolean inDanger;
+        public boolean held;
         public String activeJobId;
         public String activeChunkKey;
         public String phase = "IDLE";
