@@ -24,6 +24,7 @@ public final class FleetServerTest {
         testSleepCoordinatorNearestAndFailover();
         testChestCoordinatorLocksAndSync();
         testTaskOrderAndTopDownYBandGating();
+        testDeferredPriorityCooldownAndMaxRetries();
         System.out.println("FleetServerTest: ALL " + passed + " tests passed.");
     }
 
@@ -282,12 +283,14 @@ public final class FleetServerTest {
         p.maxBots = 2;
         p.maxDistance = 0;
 
-        // Step 1 is fill_water (further away at x=100), Step 2 is clear_area with 2 Y-bands (closer at x=0).
-        // Even though Step 2 is closer, Step 1 must finish first; then Step 2 must dig y=64 before y=48!
+        // Step 1 is fill_water (further away at x=100), Step 2 is clear_area with 2 columns x 2 Y-bands.
+        // Step 1 must finish first; then Step 2 must clear ALL y=64 chunks across both columns before ANY y=48!
         List<ChunkSpec> chunks = List.of(
                 new ChunkSpec("fill_water/100,0", 3, 0, 100, 0),
-                new ChunkSpec("clear_area/0,0,48", 0, 0, 0, 0),  // bottom band listed first intentionally
-                new ChunkSpec("clear_area/0,0,64", 0, 0, 0, 0)   // top band
+                new ChunkSpec("clear_area/0,0,48", 0, 0, 0, 0),   // bottom band of col A (closer to bot!)
+                new ChunkSpec("clear_area/0,0,64", 0, 0, 0, 0),   // top band of col A
+                new ChunkSpec("clear_area/32,0,48", 1, 0, 32, 0), // bottom band of col B
+                new ChunkSpec("clear_area/32,0,64", 1, 0, 32, 0)  // top band of col B
         );
         fm.submitJob("p1", "Layered", "{}", "minecraft:overworld", p, chunks, List.of(), "Admin");
 
@@ -296,11 +299,72 @@ public final class FleetServerTest {
         fm.reportChunk("u1", g1.jobId, g1.chunkKey, ChunkState.DONE, "");
 
         WorkGrant g2 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
-        assertTrue("clear_area/0,0,64".equals(g2.chunkKey), "Top Y-band (64) must be leased before bottom Y-band (48)");
+        assertTrue("clear_area/0,0,64".equals(g2.chunkKey), "Top Y-band (64) of nearest col must be leased first");
         fm.reportChunk("u1", g2.jobId, g2.chunkKey, ChunkState.DONE, "");
 
+        // Bot is still at x=0 (distance 0 to 0,0,48), but 32,0,64 is still unfinished on the top layer!
         WorkGrant g3 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
-        assertTrue("clear_area/0,0,48".equals(g3.chunkKey), "Bottom Y-band (48) unlocks after top band is DONE");
+        assertTrue("clear_area/32,0,64".equals(g3.chunkKey),
+                "Must finish top Y-band across all columns before dropping to y=48, got " + g3.chunkKey);
+        fm.reportChunk("u1", g3.jobId, g3.chunkKey, ChunkState.DONE, "");
+
+        WorkGrant g4 = fm.claimWork("u1", "minecraft:overworld", 32, 64, 0, g1.projectHash);
+        assertTrue("clear_area/32,0,48".equals(g4.chunkKey),
+                "Bottom Y-band (48) unlocks only after entire top band is DONE");
+        passed++;
+    }
+
+    private static void testDeferredPriorityCooldownAndMaxRetries() {
+        AtomicLong clock = new AtomicLong(8_000_000L);
+        FleetConfig cfg = new FleetConfig();
+        cfg.maxChunkRetries = 3;
+        cfg.deferCooldownSeconds = 10;
+        FleetManager fm = new FleetManager(cfg, clock::get);
+        fm.registerBot("u1", "Bot1", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 0, 64, 0);
+
+        AssignmentPolicy p = new AssignmentPolicy();
+        p.maxBots = 2;
+        p.maxDistance = 0;
+
+        List<ChunkSpec> chunks = List.of(
+                new ChunkSpec("clear/0,0,64", 0, 0, 0, 0),
+                new ChunkSpec("clear/32,0,64", 1, 0, 32, 0),
+                new ChunkSpec("clear/0,0,48", 0, 0, 0, 0)
+        );
+        FleetJob job = fm.submitJob("p1", "DeferTest", "{}", "minecraft:overworld", p, chunks, List.of(), "Admin");
+
+        // Try 1 on 0,0,64 -> DEFERRED (e.g. 9 blocks across a gap).
+        WorkGrant g1 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null);
+        assertTrue("clear/0,0,64".equals(g1.chunkKey), "Claims nearest top-band chunk");
+        fm.reportChunk("u1", job.jobId, g1.chunkKey, ChunkState.DEFERRED, "9 left");
+
+        // Even though bot is at x=0 and 0,0,64 is closer, PENDING 32,0,64 must be chosen next!
+        WorkGrant g2 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
+        assertTrue("clear/32,0,64".equals(g2.chunkKey), "PENDING chunk must take priority over DEFERRED chunk");
+        fm.reportChunk("u1", job.jobId, g2.chunkKey, ChunkState.DONE, "");
+
+        // Before 10s cooldown elapses, 0,0,64 is not re-leased immediately (bot stays idle instead of spinning).
+        WorkGrant gWait = fm.claimWork("u1", "minecraft:overworld", 32, 64, 0, g1.projectHash);
+        assertTrue(gWait.idle, "DEFERRED chunk must wait for cooldown before retry");
+
+        // Advance 10s -> Try 2 on 0,0,64 -> DEFERRED again.
+        clock.addAndGet(10_000L);
+        WorkGrant g3 = fm.claimWork("u1", "minecraft:overworld", 32, 64, 0, g1.projectHash);
+        assertTrue("clear/0,0,64".equals(g3.chunkKey), "DEFERRED chunk retries after cooldown");
+        fm.reportChunk("u1", job.jobId, g3.chunkKey, ChunkState.DEFERRED, "9 left");
+
+        // Advance 10s -> Try 3 (final retry) -> DEFERRED transitions to FAILED!
+        clock.addAndGet(10_000L);
+        WorkGrant g4 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
+        assertTrue("clear/0,0,64".equals(g4.chunkKey), "Third and final attempt on DEFERRED chunk");
+        fm.reportChunk("u1", job.jobId, g4.chunkKey, ChunkState.DEFERRED, "9 left");
+        assertTrue(job.chunks.get("clear/0,0,64").state == ChunkState.FAILED,
+                "Chunk must transition to FAILED once maxChunkRetries is reached");
+
+        // Now that y=64 has no unfinished chunks, y=48 unlocks immediately!
+        WorkGrant g5 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
+        assertTrue("clear/0,0,48".equals(g5.chunkKey),
+                "Lower Y-band must unlock once stuck top-band chunk reaches max retries");
         passed++;
     }
 

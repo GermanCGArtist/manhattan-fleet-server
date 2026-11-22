@@ -71,8 +71,15 @@ public final class FleetManager {
                         } else {
                             clearChunkOwner(ce, ChunkState.PENDING);
                         }
+                    } else if (ce.state == ChunkState.DEFERRED && ce.tries >= config.maxChunkRetries) {
+                        clearChunkOwner(ce, ChunkState.FAILED);
+                        if (ce.reason == null || ce.reason.isBlank()) {
+                            ce.reason = "max retries " + config.maxChunkRetries;
+                        }
+                        dirty = true;
                     }
                 }
+                checkJobCompletion(job);
                 jobs.put(job.jobId, job);
                 if (job.jobId.startsWith("job_")) {
                     try {
@@ -325,7 +332,7 @@ public final class FleetManager {
 
         for (FleetJob job : candidates) {
             if (!isBotEligibleForJob(bot, job)) continue;
-            ChunkEntry chosen = pickChunkForBot(bot, job);
+            ChunkEntry chosen = pickChunkForBot(bot, job, now);
             if (chosen != null) {
                 return grantChunk(bot, job, chosen, knownProjectHash, now, false);
             }
@@ -346,13 +353,15 @@ public final class FleetManager {
         ce.tries++;
         ce.reason = reason;
         if (outcome == ChunkState.DONE || outcome == ChunkState.FAILED) {
-            ce.state = outcome;
-            ce.ownerUuid = null;
-            ce.ownerName = null;
-            ce.leaseExpiresAtMs = 0L;
-            ce.graceExpiresAtMs = 0L;
+            clearChunkOwner(ce, outcome);
+        } else if (ce.tries >= config.maxChunkRetries) {
+            clearChunkOwner(ce, ChunkState.FAILED);
+            ce.reason = (reason != null && !reason.isBlank())
+                    ? reason + " (max retries " + config.maxChunkRetries + ")"
+                    : "max retries " + config.maxChunkRetries;
         } else {
             clearChunkOwner(ce, ChunkState.DEFERRED);
+            ce.nextRetryAtMs = clockMs.getAsLong() + config.deferCooldownSeconds * 1000L;
         }
 
         BotRecord bot = bots.get(botUuid);
@@ -467,7 +476,7 @@ public final class FleetManager {
         return activeOwners.size() < p.maxBots;
     }
 
-    private ChunkEntry pickChunkForBot(BotRecord bot, FleetJob job) {
+    private ChunkEntry pickChunkForBot(BotRecord bot, FleetJob job, long nowMs) {
         int maxDist = job.assignment.mode == AssignmentMode.AUTO_POOL ? job.assignment.maxDistance : 0;
         double maxDistSq = maxDist > 0 ? (double) maxDist * maxDist : Double.MAX_VALUE;
 
@@ -481,30 +490,37 @@ public final class FleetManager {
         }
         if (activeTaskId == null) return null;
 
-        // 2. Top-down Y-band gating: find highest unfinished Y-band per (taskId, x, z) column.
-        Map<String, Integer> highestUnfinishedY = new HashMap<>();
+        // 2. Global top-down Y-band gating: clear the highest unfinished Y-band across the entire task
+        //    before unlocking the next layer down (matches solo ChunkGrid layer-by-layer excavation).
+        Integer highestUnfinishedY = null;
         for (ChunkEntry ce : job.chunks.values()) {
             if (ce.state == ChunkState.DONE || ce.state == ChunkState.FAILED) continue;
             if (!activeTaskId.equals(taskIdOf(ce.chunkKey))) continue;
             Integer y = parseBandY(ce.chunkKey);
-            if (y != null) {
-                String colKey = columnKeyOf(ce.chunkKey);
-                highestUnfinishedY.merge(colKey, y, Math::max);
+            if (y != null && (highestUnfinishedY == null || y > highestUnfinishedY)) {
+                highestUnfinishedY = y;
             }
         }
 
         List<ChunkEntry> activeOthers = new ArrayList<>();
-        List<ChunkEntry> available = new ArrayList<>();
+        List<ChunkEntry> availablePending = new ArrayList<>();
+        List<ChunkEntry> availableDeferred = new ArrayList<>();
         List<ChunkEntry> gracePreemptable = new ArrayList<>();
 
         for (ChunkEntry ce : job.chunks.values()) {
             if (!activeTaskId.equals(taskIdOf(ce.chunkKey))) continue;
             if (ce.state == ChunkState.CLAIMED && !bot.uuid.equals(ce.ownerUuid)) {
                 activeOthers.add(ce);
-            } else if (ce.state == ChunkState.PENDING || ce.state == ChunkState.DEFERRED) {
+            } else if (ce.state == ChunkState.PENDING) {
                 if (!isTopUnfinishedBand(ce.chunkKey, highestUnfinishedY)) continue;
                 if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) <= maxDistSq) {
-                    available.add(ce);
+                    availablePending.add(ce);
+                }
+            } else if (ce.state == ChunkState.DEFERRED) {
+                if (ce.tries >= config.maxChunkRetries || nowMs < ce.nextRetryAtMs) continue;
+                if (!isTopUnfinishedBand(ce.chunkKey, highestUnfinishedY)) continue;
+                if (distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ) <= maxDistSq) {
+                    availableDeferred.add(ce);
                 }
             } else if (ce.state == ChunkState.DISCONNECTED_GRACE && !bot.uuid.equals(ce.ownerUuid)) {
                 if (!isTopUnfinishedBand(ce.chunkKey, highestUnfinishedY)) continue;
@@ -514,33 +530,17 @@ public final class FleetManager {
             }
         }
 
-        // Pass 1: Nearest available chunk that respects the spatial buffer from other active bots.
         int buffer = config.spatialBufferChunks;
-        ChunkEntry bestBuffered = null;
-        double bestBufferedDist = Double.MAX_VALUE;
-        for (ChunkEntry ce : available) {
-            if (buffer > 0 && isWithinSpatialBuffer(ce, activeOthers, buffer)) continue;
-            double d = distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ);
-            if (d < bestBufferedDist) {
-                bestBufferedDist = d;
-                bestBuffered = ce;
-            }
-        }
-        if (bestBuffered != null) return bestBuffered;
 
-        // Pass 2: Relax spatial buffer if only adjacent chunks remain.
-        ChunkEntry bestAny = null;
-        double bestAnyDist = Double.MAX_VALUE;
-        for (ChunkEntry ce : available) {
-            double d = distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ);
-            if (d < bestAnyDist) {
-                bestAnyDist = d;
-                bestAny = ce;
-            }
-        }
-        if (bestAny != null) return bestAny;
+        // Pass 1 & 2: Fresh PENDING chunks always take priority over DEFERRED retries.
+        ChunkEntry picked = pickNearest(bot, availablePending, activeOthers, buffer);
+        if (picked != null) return picked;
 
-        // Pass 3: If no normal chunks remain, preempt a DISCONNECTED_GRACE chunk so idle bots finish the job.
+        // Pass 3 & 4: Retry DEFERRED chunks only after all PENDING chunks in this layer are claimed/done.
+        picked = pickNearest(bot, availableDeferred, activeOthers, buffer);
+        if (picked != null) return picked;
+
+        // Pass 5: If no normal chunks remain, preempt a DISCONNECTED_GRACE chunk so idle bots finish the job.
         ChunkEntry bestGrace = null;
         double bestGraceDist = Double.MAX_VALUE;
         for (ChunkEntry ce : gracePreemptable) {
@@ -553,6 +553,34 @@ public final class FleetManager {
         return bestGrace;
     }
 
+    private static ChunkEntry pickNearest(BotRecord bot, List<ChunkEntry> candidates,
+                                          List<ChunkEntry> activeOthers, int buffer) {
+        if (candidates.isEmpty()) return null;
+        if (buffer > 0 && !activeOthers.isEmpty()) {
+            ChunkEntry bestBuffered = null;
+            double bestBufferedDist = Double.MAX_VALUE;
+            for (ChunkEntry ce : candidates) {
+                if (isWithinSpatialBuffer(ce, activeOthers, buffer)) continue;
+                double d = distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ);
+                if (d < bestBufferedDist) {
+                    bestBufferedDist = d;
+                    bestBuffered = ce;
+                }
+            }
+            if (bestBuffered != null) return bestBuffered;
+        }
+        ChunkEntry bestAny = null;
+        double bestAnyDist = Double.MAX_VALUE;
+        for (ChunkEntry ce : candidates) {
+            double d = distSq2D(bot.x, bot.z, ce.centerX, ce.centerZ);
+            if (d < bestAnyDist) {
+                bestAnyDist = d;
+                bestAny = ce;
+            }
+        }
+        return bestAny;
+    }
+
     private WorkGrant grantChunk(BotRecord bot, FleetJob job, ChunkEntry ce, String knownProjectHash,
                                  long nowMs, boolean inheritedFromGrace) {
         ce.state = ChunkState.CLAIMED;
@@ -560,6 +588,7 @@ public final class FleetManager {
         ce.ownerName = bot.name;
         ce.leaseExpiresAtMs = nowMs + config.leaseTtlSeconds * 1000L;
         ce.graceExpiresAtMs = 0L;
+        ce.nextRetryAtMs = 0L;
 
         bot.activeJobId = job.jobId;
         bot.activeChunkKey = ce.chunkKey;
@@ -647,22 +676,10 @@ public final class FleetManager {
         }
     }
 
-    private static String columnKeyOf(String chunkKey) {
-        if (chunkKey == null) return "";
-        int slash = chunkKey.indexOf('/');
-        String prefix = slash >= 0 ? chunkKey.substring(0, slash + 1) : "";
-        String coords = slash >= 0 ? chunkKey.substring(slash + 1) : chunkKey;
-        int c1 = coords.indexOf(',');
-        if (c1 < 0) return chunkKey;
-        int c2 = coords.indexOf(',', c1 + 1);
-        return c2 < 0 ? chunkKey : prefix + coords.substring(0, c2);
-    }
-
-    private static boolean isTopUnfinishedBand(String chunkKey, Map<String, Integer> highestUnfinishedY) {
+    private static boolean isTopUnfinishedBand(String chunkKey, Integer highestUnfinishedY) {
+        if (highestUnfinishedY == null) return true;
         Integer y = parseBandY(chunkKey);
-        if (y == null) return true;
-        Integer topY = highestUnfinishedY.get(columnKeyOf(chunkKey));
-        return topY == null || y >= topY;
+        return y == null || y >= highestUnfinishedY;
     }
 
     private static boolean isWithinSpatialBuffer(ChunkEntry candidate, List<ChunkEntry> activeOthers, int buffer) {
@@ -688,6 +705,7 @@ public final class FleetManager {
         ce.ownerName = null;
         ce.leaseExpiresAtMs = 0L;
         ce.graceExpiresAtMs = 0L;
+        ce.nextRetryAtMs = 0L;
     }
 
     static String sha256Short(String input) {

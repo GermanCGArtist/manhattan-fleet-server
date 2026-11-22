@@ -25,6 +25,8 @@ public final class FleetConfig {
     public int spatialBufferChunks = 1;
     public int chestLockTtlSeconds = 30;
     public int sleepTimeoutSeconds = 60;
+    public int maxChunkRetries = 3;
+    public int deferCooldownSeconds = 10;
 
     public void ensureInitialized() {
         if (editors == null) editors = new ArrayList<>();
@@ -33,6 +35,8 @@ public final class FleetConfig {
         if (spatialBufferChunks < 0) spatialBufferChunks = 0;
         if (chestLockTtlSeconds < 5) chestLockTtlSeconds = 30;
         if (sleepTimeoutSeconds < 15) sleepTimeoutSeconds = 60;
+        if (maxChunkRetries < 1) maxChunkRetries = 3;
+        if (deferCooldownSeconds < 0) deferCooldownSeconds = 0;
     }
 
     public boolean isEditorWhitelisted(UUID uuid, String name) {

@@ -93,6 +93,7 @@ public final class FleetModels {
         public String ownerName;
         public long leaseExpiresAtMs;
         public long graceExpiresAtMs;
+        public long nextRetryAtMs;
         public int tries;
         public String reason;
 
