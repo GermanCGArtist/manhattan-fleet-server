@@ -1,5 +1,9 @@
 package dev.manhattan.fleet.server;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import dev.manhattan.fleet.server.FleetModels.*;
 
 import java.nio.charset.StandardCharsets;
@@ -19,8 +23,11 @@ public final class FleetManager {
 
     private final Map<String, FleetJob> jobs = new LinkedHashMap<>();
     private final Map<String, BotRecord> bots = new LinkedHashMap<>();
+    private final Map<String, Map<String, TaskMeta>> taskMetaCache = new HashMap<>();
     private int jobCounter = 1;
     private boolean dirty = false;
+
+    private record TaskMeta(String id, String kind, Boolean waitForPrevious) {}
 
     public FleetManager(FleetConfig config, LongSupplier clockMs) {
         this.config = Objects.requireNonNull(config, "config");
@@ -477,18 +484,87 @@ public final class FleetManager {
     }
 
     private ChunkEntry pickChunkForBot(BotRecord bot, FleetJob job, long nowMs) {
-        int maxDist = job.assignment.mode == AssignmentMode.AUTO_POOL ? job.assignment.maxDistance : 0;
-        double maxDistSq = maxDist > 0 ? (double) maxDist * maxDist : Double.MAX_VALUE;
+        List<String> eligibleTasks = eligibleTaskIds(job);
+        for (String taskId : eligibleTasks) {
+            ChunkEntry picked = pickChunkInTask(bot, job, taskId, nowMs);
+            if (picked != null) return picked;
+        }
+        return null;
+    }
 
-        // 1. Task-order gating: only hand out chunks from the earliest taskId that still has unfinished chunks.
-        String activeTaskId = null;
+    /**
+     * Returns ordered unfinished taskIds eligible for leasing right now:
+     * always includes the earliest unfinished task, plus subsequent unfinished tasks until a barrier is hit
+     * ({@code waitForPrevious == true}, or {@code waitForPrevious == null} when {@code kind} changes).
+     */
+    private List<String> eligibleTaskIds(FleetJob job) {
+        List<String> unfinished = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
         for (ChunkEntry ce : job.chunks.values()) {
             if (ce.state != ChunkState.DONE && ce.state != ChunkState.FAILED) {
-                activeTaskId = taskIdOf(ce.chunkKey);
-                break;
+                String tid = taskIdOf(ce.chunkKey);
+                if (seen.add(tid)) unfinished.add(tid);
             }
         }
-        if (activeTaskId == null) return null;
+        if (unfinished.isEmpty()) return List.of();
+
+        List<String> eligible = new ArrayList<>();
+        String firstId = unfinished.get(0);
+        eligible.add(firstId);
+        if (unfinished.size() == 1) return eligible;
+
+        Map<String, TaskMeta> metaById = taskMetaFor(job);
+        if (metaById.isEmpty()) return eligible;
+        TaskMeta firstMeta = metaById.get(firstId);
+        String activeKind = firstMeta != null ? firstMeta.kind() : null;
+
+        for (int i = 1; i < unfinished.size(); i++) {
+            String tid = unfinished.get(i);
+            TaskMeta m = metaById.get(tid);
+            if (m == null) break;
+            if (Boolean.TRUE.equals(m.waitForPrevious())) break;
+            if (m.waitForPrevious() == null) {
+                if (activeKind == null || m.kind() == null || !activeKind.equalsIgnoreCase(m.kind())) {
+                    break;
+                }
+            }
+            eligible.add(tid);
+        }
+        return eligible;
+    }
+
+    private Map<String, TaskMeta> taskMetaFor(FleetJob job) {
+        if (job == null || job.projectJson == null || job.projectJson.isBlank()) return Map.of();
+        String cacheKey = (job.projectHash != null && !job.projectHash.isBlank()) ? job.projectHash : job.jobId;
+        Map<String, TaskMeta> cached = taskMetaCache.get(cacheKey);
+        if (cached != null) return cached;
+        Map<String, TaskMeta> parsed = new LinkedHashMap<>();
+        try {
+            JsonObject root = JsonParser.parseString(job.projectJson).getAsJsonObject();
+            if (root.has("tasks") && root.get("tasks").isJsonArray()) {
+                JsonArray arr = root.getAsJsonArray("tasks");
+                for (JsonElement el : arr) {
+                    if (!el.isJsonObject()) continue;
+                    JsonObject obj = el.getAsJsonObject();
+                    String id = obj.has("id") && !obj.get("id").isJsonNull() ? obj.get("id").getAsString() : null;
+                    if (id == null || id.isBlank()) continue;
+                    String kind = obj.has("kind") && !obj.get("kind").isJsonNull() ? obj.get("kind").getAsString() : null;
+                    Boolean waitPrev = null;
+                    if (obj.has("waitForPrevious") && !obj.get("waitForPrevious").isJsonNull()) {
+                        waitPrev = obj.get("waitForPrevious").getAsBoolean();
+                    }
+                    parsed.put(id, new TaskMeta(id, kind, waitPrev));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        taskMetaCache.put(cacheKey, parsed);
+        return parsed;
+    }
+
+    private ChunkEntry pickChunkInTask(BotRecord bot, FleetJob job, String activeTaskId, long nowMs) {
+        int maxDist = job.assignment.mode == AssignmentMode.AUTO_POOL ? job.assignment.maxDistance : 0;
+        double maxDistSq = maxDist > 0 ? (double) maxDist * maxDist : Double.MAX_VALUE;
 
         // 2. Global top-down Y-band gating with 1-layer lookahead:
         //    Clear the highest unfinished Y-band (topBandY) across the entire task first.

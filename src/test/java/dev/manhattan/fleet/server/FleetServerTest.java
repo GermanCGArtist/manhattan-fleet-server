@@ -26,6 +26,7 @@ public final class FleetServerTest {
         testTaskOrderAndTopDownYBandGating();
         testDeferredPriorityCooldownAndMaxRetries();
         testOneLayerLookaheadWhenTopBandClaimed();
+        testPhaseSpilloverAndExplicitBarriers();
         System.out.println("FleetServerTest: ALL " + passed + " tests passed.");
     }
 
@@ -408,6 +409,56 @@ public final class FleetServerTest {
         fm.reportChunk("u1", job.jobId, b1Next.chunkKey, ChunkState.DONE, "");
         WorkGrant b1Wait = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, b1.projectHash);
         assertTrue(b1Wait.idle, "Bot1 must not drop 2 layers ahead (y=32) while y=64 is still unfinished");
+        passed++;
+    }
+
+    private static void testPhaseSpilloverAndExplicitBarriers() {
+        AtomicLong clock = new AtomicLong(10_000_000L);
+        FleetManager fm = new FleetManager(new FleetConfig(), clock::get);
+        fm.registerBot("u1", "Bot1", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 0, 64, 0);
+        fm.registerBot("u2", "Bot2", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 64, 64, 0);
+
+        AssignmentPolicy p = new AssignmentPolicy();
+        p.maxBots = 2;
+        p.maxDistance = 0;
+
+        String projJson = """
+                {"tasks":[
+                  {"id":"fill_1","kind":"FILL_WATER"},
+                  {"id":"clear_1","kind":"CLEAR_AREA"},
+                  {"id":"clear_2","kind":"CLEAR_AREA"},
+                  {"id":"clear_3","kind":"CLEAR_AREA","waitForPrevious":true}
+                ]}""";
+        List<ChunkSpec> chunks = List.of(
+                new ChunkSpec("fill_1/0,0", 0, 0, 0, 0),
+                new ChunkSpec("clear_1/0,0,64", 0, 0, 0, 0),
+                new ChunkSpec("clear_2/64,0,64", 2, 0, 64, 0),
+                new ChunkSpec("clear_3/128,0,64", 4, 0, 128, 0)
+        );
+        FleetJob job = fm.submitJob("p1", "Barriers", projJson, "minecraft:overworld", p, chunks, List.of(), "Admin");
+
+        // Bot1 claims fill_1. Bot2 must NOT spill over into clear_1 (phase change FILL_WATER -> CLEAR_AREA).
+        WorkGrant g1 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null);
+        assertTrue("fill_1/0,0".equals(g1.chunkKey), "Bot1 claims fill_1");
+        WorkGrant g2Blocked = fm.claimWork("u2", "minecraft:overworld", 64, 64, 0, null);
+        assertTrue(g2Blocked.idle, "Auto phase barrier must block CLEAR_AREA while FILL_WATER is unfinished");
+
+        // Once fill_1 is DONE, Bot1 takes clear_1 and Bot2 automatically spills over to clear_2 (same kind)!
+        fm.reportChunk("u1", job.jobId, g1.chunkKey, ChunkState.DONE, "");
+        WorkGrant c1 = fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, g1.projectHash);
+        WorkGrant c2 = fm.claimWork("u2", "minecraft:overworld", 64, 64, 0, null);
+        assertTrue("clear_1/0,0,64".equals(c1.chunkKey), "Bot1 takes clear_1");
+        assertTrue("clear_2/64,0,64".equals(c2.chunkKey), "Bot2 spills over to same-kind clear_2");
+
+        // Bot2 finishes clear_2 while Bot1 still holds clear_1: clear_3 has waitForPrevious=true -> must block!
+        fm.reportChunk("u2", job.jobId, c2.chunkKey, ChunkState.DONE, "");
+        WorkGrant c3Blocked = fm.claimWork("u2", "minecraft:overworld", 128, 64, 0, c2.projectHash);
+        assertTrue(c3Blocked.idle, "Explicit barrier (waitForPrevious=true) must block clear_3 until clear_1 finishes");
+
+        // Once clear_1 finishes, clear_3 unlocks!
+        fm.reportChunk("u1", job.jobId, c1.chunkKey, ChunkState.DONE, "");
+        WorkGrant c3 = fm.claimWork("u2", "minecraft:overworld", 128, 64, 0, c2.projectHash);
+        assertTrue("clear_3/128,0,64".equals(c3.chunkKey), "clear_3 unlocks once clear_1 finishes");
         passed++;
     }
 
