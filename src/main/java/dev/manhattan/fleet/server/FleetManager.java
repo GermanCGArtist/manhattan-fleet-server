@@ -5,6 +5,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.manhattan.fleet.server.FleetModels.*;
+import dev.manhattan.fleet.wire.FleetWire;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -14,9 +15,18 @@ import java.util.function.LongSupplier;
 /**
  * Pure-Java fleet coordinator managing concurrent jobs, assignment policies, chunk leases,
  * 60-second rejoin grace, 1-chunk spatial separation, bed-pool assignments, and snapshots.
+ *
+ * <p>Reliability rules (protocol v2):
+ * <ul>
+ *   <li>Every grant raises the chunk's {@code leaseEpoch}. A report or lease renewal must name the current
+ *       epoch, so a bot whose lease ran out can never finish or fail a chunk someone else now holds.</li>
+ *   <li>Reports carry a {@code msgId}; the last one applied is kept on the chunk (and saved), so a report
+ *       resent after a lost acknowledgement or a restart is answered again without being applied twice.</li>
+ *   <li>A bot whose lease expired while nobody else took the chunk may still report it (same epoch).</li>
+ * </ul>
  */
 public final class FleetManager {
-    private final FleetConfig config;
+    private FleetConfig config;
     private final LongSupplier clockMs;
     private final SleepCoordinator sleepCoordinator;
     private final ChestCoordinator chestCoordinator;
@@ -26,8 +36,24 @@ public final class FleetManager {
     private final Map<String, Map<String, TaskMeta>> taskMetaCache = new HashMap<>();
     private int jobCounter = 1;
     private boolean dirty = false;
+    private long lastTickMs = Long.MIN_VALUE;
+    /** Shared hazards (death sites), newest last. */
+    private final List<HazardRecord> hazards = new ArrayList<>();
+    /**
+     * Owner index: bot uuid -> chunks it owns (CLAIMED or DISCONNECTED_GRACE). Every owner change goes through
+     * {@link #setOwner} / {@link #clearChunkOwner}, so it only has to be rebuilt after a load.
+     */
+    private final Map<String, LinkedHashMap<String, OwnedRef>> owned = new HashMap<>();
+    /** Jobs submitted since the last save whose project still has to be written to disk. */
+    private final List<FleetJob> unsavedProjects = new ArrayList<>();
 
     private record TaskMeta(String id, String kind, Boolean waitForPrevious) {}
+
+    private record OwnedRef(FleetJob job, ChunkEntry ce) {
+        String key() {
+            return job.jobId + "|" + ce.chunkKey;
+        }
+    }
 
     public FleetManager(FleetConfig config, LongSupplier clockMs) {
         this.config = Objects.requireNonNull(config, "config");
@@ -35,6 +61,17 @@ public final class FleetManager {
         this.clockMs = Objects.requireNonNull(clockMs, "clockMs");
         this.sleepCoordinator = new SleepCoordinator(config.sleepTimeoutSeconds * 1000L);
         this.chestCoordinator = new ChestCoordinator();
+    }
+
+    /** Applies a reloaded {@code config/manhattan-fleet.json} (leases, grace, buffer, retries...). */
+    public void updateConfig(FleetConfig newConfig) {
+        if (newConfig == null) return;
+        newConfig.ensureInitialized();
+        this.config = newConfig;
+    }
+
+    public FleetConfig config() {
+        return config;
     }
 
     public SleepCoordinator sleepCoordinator() {
@@ -51,6 +88,11 @@ public final class FleetManager {
         return was;
     }
 
+    /** Marks state as changed (for changes made through the chest coordinator). */
+    public void markDirty() {
+        dirty = true;
+    }
+
     public Map<String, FleetJob> jobsView() {
         return Collections.unmodifiableMap(jobs);
     }
@@ -59,44 +101,185 @@ public final class FleetManager {
         return Collections.unmodifiableCollection(bots.values());
     }
 
+    public BotRecord bot(String uuid) {
+        return bots.get(uuid);
+    }
+
+    // ------------------------------------------------------------------ Persistence
+
     public void loadPersistedJobs(List<FleetJob> persisted) {
         jobs.clear();
         int maxNum = 0;
         if (persisted != null) {
+            long now = clockMs.getAsLong();
+            long graceMs = config.rejoinGraceSeconds * 1000L;
             for (FleetJob job : persisted) {
                 if (job == null || job.jobId == null || job.jobId.isBlank()) continue;
                 job.ensureInitialized();
                 // On server restart, convert any stale CLAIMED leases into DISCONNECTED_GRACE so
                 // auto-reconnecting bots can still inherit their chunk during the grace window.
-                long now = clockMs.getAsLong();
-                long graceMs = config.rejoinGraceSeconds * 1000L;
                 for (ChunkEntry ce : job.chunks.values()) {
                     if (ce.state == ChunkState.CLAIMED) {
                         if (graceMs > 0 && ce.ownerUuid != null) {
                             ce.state = ChunkState.DISCONNECTED_GRACE;
                             ce.graceExpiresAtMs = now + graceMs;
                         } else {
-                            clearChunkOwner(ce, ChunkState.PENDING);
+                            resetChunk(ce, ChunkState.PENDING);
                         }
                     } else if (ce.state == ChunkState.DEFERRED && ce.tries >= config.maxChunkRetries) {
-                        clearChunkOwner(ce, ChunkState.FAILED);
+                        resetChunk(ce, ChunkState.FAILED);
                         if (ce.reason == null || ce.reason.isBlank()) {
                             ce.reason = "max retries " + config.maxChunkRetries;
                         }
                         dirty = true;
                     }
                 }
-                checkJobCompletion(job);
                 jobs.put(job.jobId, job);
                 if (job.jobId.startsWith("job_")) {
                     try {
                         maxNum = Math.max(maxNum, Integer.parseInt(job.jobId.substring(4)));
                     } catch (NumberFormatException ignored) {
+                        // a hand-named job id: it simply does not count for the next number
                     }
                 }
             }
         }
         jobCounter = Math.max(jobCounter, maxNum + 1);
+        rebuildOwnerIndex();
+        for (FleetJob job : jobs.values()) checkJobCompletion(job);
+    }
+
+    /** Restores everything a {@link FleetStore} saved: jobs, bots (all offline), hazards and chest stock. */
+    public void importState(FleetStore.PersistedState st) {
+        if (st == null) return;
+        loadPersistedJobs(st.jobs);
+        jobCounter = Math.max(jobCounter, st.jobCounter);
+        bots.clear();
+        if (st.bots != null) {
+            for (FleetStore.PersistedBot pb : st.bots) {
+                if (pb == null || pb.uuid == null || pb.uuid.isBlank()) continue;
+                BotRecord b = new BotRecord();
+                b.uuid = pb.uuid;
+                b.name = pb.name;
+                b.mode = pb.mode == null ? ClientMode.LOCAL : pb.mode;
+                b.tags = pb.tags != null ? new ArrayList<>(pb.tags) : new ArrayList<>();
+                b.held = pb.held;
+                b.activeJobId = pb.activeJobId;
+                b.assignedBed = pb.assignedBed != null && pb.assignedBed.length == 3 ? pb.assignedBed.clone() : null;
+                b.online = false;
+                b.phase = b.held ? "HELD" : "OFFLINE";
+                bots.put(b.uuid, b);
+            }
+        }
+        hazards.clear();
+        if (st.hazards != null) {
+            for (HazardRecord h : st.hazards) if (h != null) hazards.add(h);
+        }
+        pruneHazards(clockMs.getAsLong());
+        chestCoordinator.importChests(st.chests);
+    }
+
+    /** Everything worth keeping over a restart, for {@link FleetStore#saveAsync}. */
+    public FleetStore.PersistedState exportState() {
+        FleetStore.PersistedState st = new FleetStore.PersistedState();
+        st.jobCounter = jobCounter;
+        st.jobs.addAll(jobs.values());
+        for (BotRecord b : bots.values()) {
+            FleetStore.PersistedBot pb = new FleetStore.PersistedBot();
+            pb.uuid = b.uuid;
+            pb.name = b.name;
+            pb.mode = b.mode;
+            pb.tags = new ArrayList<>(b.tags);
+            pb.held = b.held;
+            pb.activeJobId = b.activeJobId;
+            pb.assignedBed = b.assignedBed;
+            st.bots.add(pb);
+        }
+        st.hazards.addAll(hazards);
+        st.chests.addAll(chestCoordinator.exportChests());
+        return st;
+    }
+
+    /** Jobs whose project still has to be written by the store; clears the list. */
+    public List<FleetJob> drainUnsavedProjects() {
+        List<FleetJob> out = new ArrayList<>(unsavedProjects);
+        unsavedProjects.clear();
+        return out;
+    }
+
+    // ------------------------------------------------------------------ Owner index
+
+    private void rebuildOwnerIndex() {
+        owned.clear();
+        for (FleetJob job : jobs.values()) {
+            for (ChunkEntry ce : job.chunks.values()) {
+                boolean owns = ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE;
+                if (owns && ce.ownerUuid != null) {
+                    indexAdd(ce.ownerUuid, job, ce);
+                } else if (owns) {
+                    resetChunk(ce, ChunkState.PENDING);
+                } else if (ce.ownerUuid != null) {
+                    ce.ownerUuid = null;
+                    ce.ownerName = null;
+                }
+            }
+        }
+    }
+
+    private void indexAdd(String uuid, FleetJob job, ChunkEntry ce) {
+        OwnedRef ref = new OwnedRef(job, ce);
+        owned.computeIfAbsent(uuid, k -> new LinkedHashMap<>()).put(ref.key(), ref);
+    }
+
+    private void indexRemove(String uuid, FleetJob job, ChunkEntry ce) {
+        if (uuid == null) return;
+        LinkedHashMap<String, OwnedRef> m = owned.get(uuid);
+        if (m == null) return;
+        m.remove(job.jobId + "|" + ce.chunkKey);
+        if (m.isEmpty()) owned.remove(uuid);
+    }
+
+    /** Chunks a bot owns right now (a copy, so states may change while iterating). */
+    private List<OwnedRef> ownedBy(String uuid) {
+        LinkedHashMap<String, OwnedRef> m = owned.get(uuid);
+        return m == null ? List.of() : new ArrayList<>(m.values());
+    }
+
+    /** Distinct owners of chunks of {@code job}, not counting {@code exceptUuid}. */
+    private int ownersOf(FleetJob job, String exceptUuid) {
+        int n = 0;
+        for (Map.Entry<String, LinkedHashMap<String, OwnedRef>> e : owned.entrySet()) {
+            if (e.getKey().equals(exceptUuid)) continue;
+            for (OwnedRef r : e.getValue().values()) {
+                if (r.job() == job) {
+                    n++;
+                    break;
+                }
+            }
+        }
+        return n;
+    }
+
+    /** Checks the owner index against the chunk states (tests). Returns null when they agree. */
+    String verifyOwnerIndex() {
+        int indexed = 0;
+        for (var m : owned.values()) indexed += m.size();
+        int actual = 0;
+        for (FleetJob job : jobs.values()) {
+            for (ChunkEntry ce : job.chunks.values()) {
+                boolean shouldOwn = ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE;
+                if (shouldOwn != (ce.ownerUuid != null)) {
+                    return job.jobId + "/" + ce.chunkKey + " state " + ce.state + " owner " + ce.ownerUuid;
+                }
+                if (ce.ownerUuid == null) continue;
+                actual++;
+                var m = owned.get(ce.ownerUuid);
+                if (m == null || !m.containsKey(job.jobId + "|" + ce.chunkKey)) {
+                    return "index misses " + job.jobId + "/" + ce.chunkKey + " of " + ce.ownerName;
+                }
+            }
+        }
+        return indexed == actual ? null : "index holds " + indexed + " chunk(s), states say " + actual;
     }
 
     // ------------------------------------------------------------------ Bot Lifecycle
@@ -120,6 +303,8 @@ public final class FleetManager {
         rec.localBed = (localBed != null && localBed.length == 3) ? localBed.clone() : null;
         rec.lastHeartbeatMs = now;
         rec.disconnectedAtMs = 0L;
+        if (rec.held) rec.phase = "HELD";
+        dirty = true;
         return rec;
     }
 
@@ -134,21 +319,21 @@ public final class FleetManager {
 
         // Put any active CLAIMED chunk into DISCONNECTED_GRACE so a rejoining bot inherits it.
         long graceMs = config.rejoinGraceSeconds * 1000L;
-        for (FleetJob job : jobs.values()) {
-            for (ChunkEntry ce : job.chunks.values()) {
-                if (ce.state == ChunkState.CLAIMED && uuid.equals(ce.ownerUuid)) {
-                    if (graceMs > 0) {
-                        ce.state = ChunkState.DISCONNECTED_GRACE;
-                        ce.graceExpiresAtMs = now + graceMs;
-                    } else {
-                        clearChunkOwner(ce, ChunkState.PENDING);
-                    }
-                    dirty = true;
+        for (OwnedRef r : ownedBy(uuid)) {
+            ChunkEntry ce = r.ce();
+            if (ce.state == ChunkState.CLAIMED) {
+                if (graceMs > 0) {
+                    ce.state = ChunkState.DISCONNECTED_GRACE;
+                    ce.graceExpiresAtMs = now + graceMs;
+                } else {
+                    clearChunkOwner(r.job(), ce, ChunkState.PENDING);
                 }
+                dirty = true;
             }
         }
 
         chestCoordinator.releaseAllForBot(uuid);
+        chestCoordinator.dropReservationsOf(uuid);
         return sleepCoordinator.onBotUnavailable(uuid, now, bots.values());
     }
 
@@ -161,16 +346,12 @@ public final class FleetManager {
             bot.phase = "DEAD";
             bot.alertSummary = "Died; leases released";
         }
-        for (FleetJob job : jobs.values()) {
-            for (ChunkEntry ce : job.chunks.values()) {
-                if ((ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE)
-                        && uuid.equals(ce.ownerUuid)) {
-                    clearChunkOwner(ce, ChunkState.PENDING);
-                    dirty = true;
-                }
-            }
+        for (OwnedRef r : ownedBy(uuid)) {
+            clearChunkOwner(r.job(), r.ce(), ChunkState.PENDING);
+            dirty = true;
         }
         chestCoordinator.releaseAllForBot(uuid);
+        chestCoordinator.dropReservationsOf(uuid);
         return sleepCoordinator.onBotUnavailable(uuid, now, bots.values());
     }
 
@@ -178,6 +359,15 @@ public final class FleetManager {
                                 double health, int food, int freeSlots, boolean inDanger,
                                 String activeJobId, String activeChunkKey, String phase,
                                 String alertSummary, int[] localBed) {
+        updateHeartbeat(uuid, dimension, x, y, z, health, food, freeSlots, inDanger, activeJobId, activeChunkKey,
+                phase, alertSummary, localBed, 0L);
+    }
+
+    /** Heartbeat; renews the bot's lease only when {@code leaseEpoch} names the current grant (0 = any). */
+    public void updateHeartbeat(String uuid, String dimension, int x, int y, int z,
+                                double health, int food, int freeSlots, boolean inDanger,
+                                String activeJobId, String activeChunkKey, String phase,
+                                String alertSummary, int[] localBed, long leaseEpoch) {
         long now = clockMs.getAsLong();
         BotRecord bot = bots.get(uuid);
         if (bot == null) return;
@@ -190,17 +380,18 @@ public final class FleetManager {
         bot.food = food;
         bot.freeSlots = freeSlots;
         bot.inDanger = inDanger;
-        if (phase != null) bot.phase = phase;
+        if (phase != null && !bot.held) bot.phase = phase;
         if (alertSummary != null) bot.alertSummary = alertSummary;
         if (localBed != null && localBed.length == 3) bot.localBed = localBed.clone();
         bot.lastHeartbeatMs = now;
 
-        // Renew active lease if matching.
+        // Renew the active lease when it is the one this bot holds.
         if (activeJobId != null && activeChunkKey != null) {
             FleetJob job = jobs.get(activeJobId);
             if (job != null) {
                 ChunkEntry ce = job.chunks.get(activeChunkKey);
-                if (ce != null && ce.state == ChunkState.CLAIMED && uuid.equals(ce.ownerUuid)) {
+                if (ce != null && ce.state == ChunkState.CLAIMED && uuid.equals(ce.ownerUuid)
+                        && (leaseEpoch <= 0 || leaseEpoch == ce.leaseEpoch)) {
                     ce.leaseExpiresAtMs = now + config.leaseTtlSeconds * 1000L;
                 }
             }
@@ -242,6 +433,7 @@ public final class FleetManager {
             job.status = JobStatus.DONE;
         }
         jobs.put(job.jobId, job);
+        unsavedProjects.add(job);
         dirty = true;
         return job;
     }
@@ -257,7 +449,9 @@ public final class FleetManager {
     public boolean resumeJob(String jobId) {
         FleetJob job = jobs.get(jobId);
         if (job == null || job.status != JobStatus.PAUSED) return false;
+        if (job.projectJson == null) return false; // project file missing: nothing to hand to workers
         job.status = JobStatus.ACTIVE;
+        job.statusReason = "";
         dirty = true;
         return true;
     }
@@ -276,7 +470,7 @@ public final class FleetManager {
         for (ChunkEntry ce : job.chunks.values()) {
             if (ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE) {
                 if (ce.ownerUuid != null) affected.add(ce.ownerUuid);
-                clearChunkOwner(ce, ChunkState.PENDING);
+                clearChunkOwner(job, ce, ChunkState.PENDING);
             }
         }
         for (BotRecord bot : bots.values()) {
@@ -294,7 +488,7 @@ public final class FleetManager {
     /** Cancels all ACTIVE/PAUSED jobs and returns UUIDs of all affected workers. */
     public List<String> cancelAllJobs() {
         Set<String> affected = new LinkedHashSet<>();
-        for (FleetJob job : jobs.values()) {
+        for (FleetJob job : new ArrayList<>(jobs.values())) {
             if (job.status == JobStatus.ACTIVE || job.status == JobStatus.PAUSED) {
                 affected.addAll(cancelJobAndListWorkers(job.jobId));
             }
@@ -307,8 +501,11 @@ public final class FleetManager {
         int removed = 0;
         Iterator<Map.Entry<String, FleetJob>> it = jobs.entrySet().iterator();
         while (it.hasNext()) {
-            JobStatus st = it.next().getValue().status;
-            if (st == JobStatus.DONE || st == JobStatus.CANCELLED) {
+            FleetJob job = it.next().getValue();
+            if (job.status == JobStatus.DONE || job.status == JobStatus.CANCELLED) {
+                for (ChunkEntry ce : job.chunks.values()) {
+                    if (ce.ownerUuid != null) clearChunkOwner(job, ce, ce.state);
+                }
                 it.remove();
                 removed++;
             }
@@ -359,6 +556,7 @@ public final class FleetManager {
                 }
             }
             if (!listed && bot.name != null && !bot.name.isBlank()) {
+                target.assignment.explicitBots = new ArrayList<>(target.assignment.explicitBots);
                 target.assignment.explicitBots.add(bot.name);
             }
         }
@@ -367,13 +565,8 @@ public final class FleetManager {
     }
 
     private void releaseAllChunksForBot(String botUuid) {
-        for (FleetJob job : jobs.values()) {
-            for (ChunkEntry ce : job.chunks.values()) {
-                if ((ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE)
-                        && botUuid.equals(ce.ownerUuid)) {
-                    clearChunkOwner(ce, ChunkState.PENDING);
-                }
-            }
+        for (OwnedRef r : ownedBy(botUuid)) {
+            clearChunkOwner(r.job(), r.ce(), ChunkState.PENDING);
         }
     }
 
@@ -390,7 +583,7 @@ public final class FleetManager {
 
     public WorkGrant claimWork(String botUuid, String dimension, int x, int y, int z, String knownProjectHash) {
         long now = clockMs.getAsLong();
-        tick(now);
+        tickIfDue(now);
 
         BotRecord bot = bots.get(botUuid);
         if (bot == null || !bot.online) return WorkGrant.idle();
@@ -406,24 +599,20 @@ public final class FleetManager {
         bot.z = z;
         bot.lastHeartbeatMs = now;
 
-        // 1. Rejoin grace inheritance: if this bot owns an unexpired DISCONNECTED_GRACE chunk on an ACTIVE job
-        //    in the same dimension, hand back the exact same chunk immediately.
-        for (FleetJob job : jobs.values()) {
-            if (job.status != JobStatus.ACTIVE) continue;
-            if (!job.dimension.equals(bot.dimension)) continue;
-            for (ChunkEntry ce : job.chunks.values()) {
-                if ((ce.state == ChunkState.DISCONNECTED_GRACE || ce.state == ChunkState.CLAIMED)
-                        && botUuid.equals(ce.ownerUuid)) {
-                    boolean wasGrace = ce.state == ChunkState.DISCONNECTED_GRACE;
-                    return grantChunk(bot, job, ce, knownProjectHash, now, wasGrace);
-                }
-            }
+        // 1. Rejoin grace inheritance: if this bot owns an unexpired DISCONNECTED_GRACE (or still CLAIMED)
+        //    chunk on an ACTIVE job in the same dimension, hand back the exact same chunk immediately.
+        for (OwnedRef r : ownedBy(botUuid)) {
+            FleetJob job = r.job();
+            ChunkEntry ce = r.ce();
+            if (job.status != JobStatus.ACTIVE || !job.dimension.equals(bot.dimension)) continue;
+            boolean wasGrace = ce.state == ChunkState.DISCONNECTED_GRACE;
+            return grantChunk(bot, job, ce, knownProjectHash, now, wasGrace, false);
         }
 
         // 2. Build ordered list of active jobs in this dimension: sticky job first, then by priority desc / createdAt asc.
         List<FleetJob> candidates = new ArrayList<>();
         for (FleetJob job : jobs.values()) {
-            if (job.status == JobStatus.ACTIVE && job.dimension.equals(bot.dimension)) {
+            if (job.status == JobStatus.ACTIVE && job.dimension.equals(bot.dimension) && job.projectJson != null) {
                 candidates.add(job);
             }
         }
@@ -441,7 +630,7 @@ public final class FleetManager {
             if (!isBotEligibleForJob(bot, job)) continue;
             ChunkEntry chosen = pickChunkForBot(bot, job, now);
             if (chosen != null) {
-                return grantChunk(bot, job, chosen, knownProjectHash, now, false);
+                return grantChunk(bot, job, chosen, knownProjectHash, now, false, true);
             }
         }
 
@@ -450,24 +639,63 @@ public final class FleetManager {
         return WorkGrant.idle();
     }
 
+    /** Old entry point (no epoch, no message id): kept for tests and tools. */
     public boolean reportChunk(String botUuid, String jobId, String chunkKey, ChunkState outcome, String reason) {
+        return reportChunk(botUuid, jobId, chunkKey, outcome, reason, 0L, null).accepted();
+    }
+
+    /**
+     * Applies a chunk report. Answered in every case (the caller sends the result back as report_ack):
+     * <ul>
+     *   <li>the same {@code msgId} again: accepted as a duplicate, nothing changes;</li>
+     *   <li>an epoch that is not the chunk's current one: rejected as stale;</li>
+     *   <li>a chunk held by another bot, or already finished: rejected (DONE on a DONE chunk is a duplicate).</li>
+     * </ul>
+     */
+    public ReportResult reportChunk(String botUuid, String jobId, String chunkKey, ChunkState outcome, String reason,
+                                    long leaseEpoch, String msgId) {
         FleetJob job = jobs.get(jobId);
-        if (job == null) return false;
+        if (job == null) return ReportResult.reject("unknown job " + jobId);
         ChunkEntry ce = job.chunks.get(chunkKey);
-        if (ce == null) return false;
-        if (ce.ownerUuid != null && !ce.ownerUuid.equals(botUuid)) return false;
+        if (ce == null) return ReportResult.reject("unknown chunk " + chunkKey);
+        if (msgId != null && !msgId.isBlank() && msgId.equals(ce.lastReportId)) return ReportResult.dup();
+        if (outcome == null) outcome = ChunkState.DEFERRED;
+        if (outcome != ChunkState.DONE && outcome != ChunkState.DEFERRED && outcome != ChunkState.FAILED) {
+            return ReportResult.reject("bad outcome " + outcome);
+        }
+        if (leaseEpoch > 0 && leaseEpoch != ce.leaseEpoch) {
+            return ReportResult.reject("stale lease (epoch " + leaseEpoch + ", current " + ce.leaseEpoch + ")");
+        }
+        if (ce.ownerUuid != null && !ce.ownerUuid.equals(botUuid)) {
+            return ReportResult.reject("chunk is held by " + ce.ownerName);
+        }
+        if (ce.state == ChunkState.DONE || ce.state == ChunkState.FAILED) {
+            if (ce.state == ChunkState.DONE && outcome == ChunkState.DONE && botUuid.equals(ce.doneBy)) {
+                return ReportResult.dup();
+            }
+            return ReportResult.reject("chunk already " + ce.state);
+        }
+        if (leaseEpoch <= 0 && ce.ownerUuid == null && ce.state != ChunkState.PENDING
+                && ce.state != ChunkState.DEFERRED) {
+            return ReportResult.reject("no lease");
+        }
 
         ce.tries++;
         ce.reason = reason;
-        if (outcome == ChunkState.DONE || outcome == ChunkState.FAILED) {
-            clearChunkOwner(ce, outcome);
+        ce.lastReportId = (msgId == null || msgId.isBlank()) ? null : msgId;
+        if (outcome == ChunkState.DONE) {
+            clearChunkOwner(job, ce, ChunkState.DONE);
+            ce.doneCount++;
+            ce.doneBy = botUuid;
+        } else if (outcome == ChunkState.FAILED) {
+            clearChunkOwner(job, ce, ChunkState.FAILED);
         } else if (ce.tries >= config.maxChunkRetries) {
-            clearChunkOwner(ce, ChunkState.FAILED);
+            clearChunkOwner(job, ce, ChunkState.FAILED);
             ce.reason = (reason != null && !reason.isBlank())
                     ? reason + " (max retries " + config.maxChunkRetries + ")"
                     : "max retries " + config.maxChunkRetries;
         } else {
-            clearChunkOwner(ce, ChunkState.DEFERRED);
+            clearChunkOwner(job, ce, ChunkState.DEFERRED);
             ce.nextRetryAtMs = clockMs.getAsLong() + config.deferCooldownSeconds * 1000L;
         }
 
@@ -478,27 +706,71 @@ public final class FleetManager {
 
         checkJobCompletion(job);
         dirty = true;
-        return true;
+        return ReportResult.ok();
+    }
+
+    // ------------------------------------------------------------------ Hazards
+
+    /** Records a shared hazard; returns it, or null when one at the same spot is already known. */
+    public HazardRecord reportHazard(String botName, String dimension, int x, int y, int z, String kind) {
+        long now = clockMs.getAsLong();
+        pruneHazards(now);
+        for (HazardRecord h : hazards) {
+            if (Objects.equals(h.dimension, dimension) && Math.abs(h.x - x) <= 2 && Math.abs(h.y - y) <= 2
+                    && Math.abs(h.z - z) <= 2 && now - h.timestampMs < 60_000L) {
+                return null;
+            }
+        }
+        HazardRecord h = new HazardRecord();
+        h.dimension = dimension == null ? "minecraft:overworld" : dimension;
+        h.x = x;
+        h.y = y;
+        h.z = z;
+        h.kind = kind == null || kind.isBlank() ? "death" : kind;
+        h.reportedBy = botName;
+        h.timestampMs = now;
+        hazards.add(h);
+        while (hazards.size() > FleetWire.MAX_HAZARDS) hazards.remove(0);
+        dirty = true;
+        return h;
+    }
+
+    public List<HazardRecord> hazards() {
+        pruneHazards(clockMs.getAsLong());
+        return new ArrayList<>(hazards);
+    }
+
+    private void pruneHazards(long now) {
+        if (hazards.removeIf(h -> now - h.timestampMs > FleetWire.HAZARD_TTL_MS)) dirty = true;
     }
 
     // ------------------------------------------------------------------ Maintenance Tick
 
-    public void tick(long nowMs) {
-        chestCoordinator.expireLocks(nowMs);
+    /** {@link #tick} at most every 250 ms (claims call it, and many bots claim at once). */
+    private void tickIfDue(long nowMs) {
+        if (lastTickMs != Long.MIN_VALUE && nowMs - lastTickMs < 250L && nowMs >= lastTickMs) return;
+        tick(nowMs);
+    }
 
-        for (FleetJob job : jobs.values()) {
-            if (job.status != JobStatus.ACTIVE) continue;
-            for (ChunkEntry ce : job.chunks.values()) {
+    public void tick(long nowMs) {
+        lastTickMs = nowMs;
+        chestCoordinator.expireLocks(nowMs);
+        if (chestCoordinator.expireReservations(nowMs)) dirty = true;
+
+        for (Map.Entry<String, LinkedHashMap<String, OwnedRef>> e : new ArrayList<>(owned.entrySet())) {
+            for (OwnedRef r : new ArrayList<>(e.getValue().values())) {
+                ChunkEntry ce = r.ce();
                 if (ce.state == ChunkState.CLAIMED && ce.leaseExpiresAtMs > 0 && nowMs >= ce.leaseExpiresAtMs) {
-                    clearChunkOwner(ce, ChunkState.PENDING);
+                    clearChunkOwner(r.job(), ce, ChunkState.PENDING);
                     dirty = true;
-                } else if (ce.state == ChunkState.DISCONNECTED_GRACE && ce.graceExpiresAtMs > 0 && nowMs >= ce.graceExpiresAtMs) {
-                    clearChunkOwner(ce, ChunkState.PENDING);
+                } else if (ce.state == ChunkState.DISCONNECTED_GRACE && ce.graceExpiresAtMs > 0
+                        && nowMs >= ce.graceExpiresAtMs) {
+                    clearChunkOwner(r.job(), ce, ChunkState.PENDING);
                     dirty = true;
                 }
             }
-            checkJobCompletion(job);
         }
+        for (FleetJob job : jobs.values()) checkJobCompletion(job);
     }
 
     public FleetSnapshot snapshot() {
@@ -515,6 +787,7 @@ public final class FleetManager {
             js.projectName = job.projectName;
             js.dimension = job.dimension;
             js.status = job.status;
+            js.statusReason = job.statusReason;
             js.assignment = job.assignment;
             js.totalChunks = job.chunks.size();
 
@@ -535,6 +808,7 @@ public final class FleetManager {
                         pc.centerZ = ce.centerZ;
                         pc.ownerName = ce.ownerName;
                         pc.state = ce.state;
+                        pc.leaseEpoch = ce.leaseEpoch;
                         snap.activeClaims.add(pc);
                     }
                     default -> {}
@@ -572,15 +846,8 @@ public final class FleetManager {
             if (!hasTag) return false;
         }
 
-        // Enforce maxBots (count distinct active/grace owners excluding this bot).
-        Set<String> activeOwners = new HashSet<>();
-        for (ChunkEntry ce : job.chunks.values()) {
-            if ((ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE)
-                    && ce.ownerUuid != null && !ce.ownerUuid.equals(bot.uuid)) {
-                activeOwners.add(ce.ownerUuid);
-            }
-        }
-        return activeOwners.size() < p.maxBots;
+        // Enforce maxBots (distinct active/grace owners other than this bot).
+        return ownersOf(job, bot.uuid) < p.maxBots;
     }
 
     private ChunkEntry pickChunkForBot(BotRecord bot, FleetJob job, long nowMs) {
@@ -656,7 +923,9 @@ public final class FleetManager {
                     parsed.put(id, new TaskMeta(id, kind, waitPrev));
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            // not a Manhattan project (tests submit "{}"): no task metadata, the first unfinished task runs alone
+            parsed.clear();
         }
         taskMetaCache.put(cacheKey, parsed);
         return parsed;
@@ -666,7 +935,7 @@ public final class FleetManager {
         int maxDist = job.assignment.mode == AssignmentMode.AUTO_POOL ? job.assignment.maxDistance : 0;
         double maxDistSq = maxDist > 0 ? (double) maxDist * maxDist : Double.MAX_VALUE;
 
-        // 2. Global top-down Y-band gating with 1-layer lookahead:
+        // Global top-down Y-band gating with 1-layer lookahead:
         //    Clear the highest unfinished Y-band (topBandY) across the entire task first.
         //    If no claimable chunks remain on topBandY (e.g. peers hold the last chunk(s)), allow an idle
         //    bot to start at most 1 layer down (nextBandY) on columns whose topBandY chunk is already finished.
@@ -779,10 +1048,13 @@ public final class FleetManager {
     }
 
     private WorkGrant grantChunk(BotRecord bot, FleetJob job, ChunkEntry ce, String knownProjectHash,
-                                 long nowMs, boolean inheritedFromGrace) {
+                                 long nowMs, boolean inheritedFromGrace, boolean newEpoch) {
+        if (ce.ownerUuid != null && !ce.ownerUuid.equals(bot.uuid)) {
+            indexRemove(ce.ownerUuid, job, ce); // grace pre-emption: the old owner loses it
+        }
+        if (newEpoch || ce.leaseEpoch <= 0) ce.leaseEpoch++;
+        setOwner(job, ce, bot);
         ce.state = ChunkState.CLAIMED;
-        ce.ownerUuid = bot.uuid;
-        ce.ownerName = bot.name;
         ce.leaseExpiresAtMs = nowMs + config.leaseTtlSeconds * 1000L;
         ce.graceExpiresAtMs = 0L;
         ce.nextRetryAtMs = 0L;
@@ -805,6 +1077,7 @@ public final class FleetManager {
         grant.assignedBed = bed;
         grant.leaseExpiresAtMs = ce.leaseExpiresAtMs;
         grant.inheritedFromGrace = inheritedFromGrace;
+        grant.leaseEpoch = ce.leaseEpoch;
 
         dirty = true;
         return grant;
@@ -916,7 +1189,20 @@ public final class FleetManager {
         return dx * dx + dz * dz;
     }
 
-    private static void clearChunkOwner(ChunkEntry ce, ChunkState newState) {
+    private void setOwner(FleetJob job, ChunkEntry ce, BotRecord bot) {
+        if (ce.ownerUuid != null && !ce.ownerUuid.equals(bot.uuid)) indexRemove(ce.ownerUuid, job, ce);
+        ce.ownerUuid = bot.uuid;
+        ce.ownerName = bot.name;
+        indexAdd(bot.uuid, job, ce);
+    }
+
+    /** Every owner release goes through here so the owner index stays right. */
+    private void clearChunkOwner(FleetJob job, ChunkEntry ce, ChunkState newState) {
+        indexRemove(ce.ownerUuid, job, ce);
+        resetChunk(ce, newState);
+    }
+
+    private static void resetChunk(ChunkEntry ce, ChunkState newState) {
         ce.state = newState;
         ce.ownerUuid = null;
         ce.ownerName = null;

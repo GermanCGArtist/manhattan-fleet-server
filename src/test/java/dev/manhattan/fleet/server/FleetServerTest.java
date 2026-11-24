@@ -28,6 +28,7 @@ public final class FleetServerTest {
         testOneLayerLookaheadWhenTopBandClaimed();
         testPhaseSpilloverAndExplicitBarriers();
         testWorkerStopHoldReassignAndJobCancel();
+        passed += FleetReliabilityTest.runAll();
         System.out.println("FleetServerTest: ALL " + passed + " tests passed.");
     }
 
@@ -215,17 +216,24 @@ public final class FleetServerTest {
         ), List.of(new int[]{1, 64, 1}), "Admin");
         fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null);
 
-        Path tmp = Files.createTempFile("manhattan-fleet-test-", ".json");
+        Path dir = Files.createTempDirectory("manhattan-fleet-test-");
         try {
-            FleetStore.save(tmp, fm.jobsView().values());
+            FleetStore store = new FleetStore(dir.resolve("manhattan-fleet.json"));
+            for (FleetJob j : fm.drainUnsavedProjects()) store.saveProjectIfAbsent(j.projectHash, j.projectJson);
+            store.saveNowAndFlush(fm.exportState());
+            store.close();
             FleetManager reloaded = new FleetManager(new FleetConfig(), clock::get);
-            reloaded.loadPersistedJobs(FleetStore.load(tmp));
+            FleetStore store2 = new FleetStore(dir.resolve("manhattan-fleet.json"));
+            reloaded.importState(store2.load().state());
+            store2.close();
             FleetJob rJob = reloaded.jobsView().get(job.jobId);
             assertTrue(rJob != null && rJob.chunks.size() == 2, "Persisted job must reload cleanly");
+            assertTrue("{\"id\":\"p1\"}".equals(rJob.projectJson), "Project JSON must come back from its own file");
             assertTrue(rJob.chunks.get("c0").state == ChunkState.DISCONNECTED_GRACE,
                     "Claimed chunk must become DISCONNECTED_GRACE after server restart");
+            assertTrue(reloaded.verifyOwnerIndex() == null, "Owner index must be rebuilt after a load");
         } finally {
-            Files.deleteIfExists(tmp);
+            FleetReliabilityTest.deleteTree(dir);
         }
         passed++;
     }

@@ -25,6 +25,29 @@ processResources {
     }
 }
 
+// Server-side benchmark bridge for Deming fleet scenarios (tests/deming in Manhattan): its own jar,
+// build/libs/manhattan-fleet-benchbridge-<version>.jar. Never install it on a real server.
+sourceSets {
+    benchmark {
+        compileClasspath += sourceSets.main.compileClasspath + sourceSets.main.output
+        runtimeClasspath += sourceSets.main.runtimeClasspath + sourceSets.main.output
+    }
+}
+processBenchmarkResources {
+    def version = project.version
+    inputs.property "version", version
+    filesMatching("fabric.mod.json") {
+        expand "version": version
+    }
+}
+tasks.register('benchBridgeJar', Jar) {
+    group = 'build'
+    description = 'Builds the server-side fleet benchmark bridge (test only).'
+    archiveBaseName = 'manhattan-fleet-benchbridge'
+    from sourceSets.benchmark.output
+}
+tasks.named('assemble') { dependsOn 'benchBridgeJar' }
+
 tasks.withType(JavaCompile).configureEach {
     options.release = 25
     options.compilerArgs += ['-Xlint:unchecked']

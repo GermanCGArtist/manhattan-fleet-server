@@ -11,7 +11,7 @@ import java.util.Map;
 public final class FleetModels {
     private FleetModels() {}
 
-    public static final int PROTOCOL_VERSION = 1;
+    public static final int PROTOCOL_VERSION = dev.manhattan.fleet.wire.FleetWire.PROTOCOL_VERSION;
 
     public enum ClientMode {
         LOCAL,
@@ -96,6 +96,13 @@ public final class FleetModels {
         public long nextRetryAtMs;
         public int tries;
         public String reason;
+        /** Raised on every grant; a report or lease renewal must name the current epoch. */
+        public long leaseEpoch;
+        /** {@code msgId} of the last report applied to this chunk, so a resent report is answered, not applied again. */
+        public String lastReportId;
+        /** Accepted DONE reports (must end at exactly 1; more means work was done twice). */
+        public int doneCount;
+        public String doneBy;
 
         public ChunkEntry() {}
 
@@ -114,9 +121,12 @@ public final class FleetModels {
         public String projectId;
         public String projectName;
         public String projectHash;
-        public String projectJson;
+        /** Not written to the state file: projects are stored once per hash next to it (see FleetStore). */
+        public transient String projectJson;
         public String dimension = "minecraft:overworld";
         public JobStatus status = JobStatus.ACTIVE;
+        /** Why the job is in its status when the server put it there (e.g. a missing project file). */
+        public String statusReason = "";
         public AssignmentPolicy assignment = new AssignmentPolicy();
         public String createdBy = "";
         public long createdAtMs;
@@ -133,6 +143,7 @@ public final class FleetModels {
             if (bedPool == null) bedPool = new ArrayList<>();
             if (chunks == null) chunks = new LinkedHashMap<>();
             if (botBeds == null) botBeds = new LinkedHashMap<>();
+            if (statusReason == null) statusReason = "";
         }
     }
 
@@ -180,6 +191,10 @@ public final class FleetModels {
         public int[] assignedBed;
         public long leaseExpiresAtMs;
         public boolean inheritedFromGrace;
+        /** Must be sent back with every report and heartbeat for this chunk. */
+        public long leaseEpoch;
+        /** Echo of the {@code claimId} of the request this grant answers (null for a hand-off). */
+        public String claimId;
 
         public static WorkGrant idle() {
             WorkGrant g = new WorkGrant();
@@ -199,10 +214,42 @@ public final class FleetModels {
         public String lockedByUuid;
         public String lockedByName;
         public long lockExpiresAtMs;
+        /** Item id -> count as last seen inside the chest by a bot. */
+        public Map<String, Integer> stock = new LinkedHashMap<>();
+        public long stockAtMs;
+        public String stockBy;
+        /** Live reservations (expired ones are dropped on every change). */
+        public List<Reservation> reservations = new ArrayList<>();
 
         public String key() {
             return dimension + ":" + x + "," + y + "," + z;
         }
+    }
+
+    public static final class Reservation {
+        public String botUuid;
+        public String botName;
+        public String item;
+        public int count;
+        public long expiresAtMs;
+    }
+
+    /** A place the fleet should avoid (a bot died there). */
+    public static final class HazardRecord {
+        public String dimension;
+        public int x;
+        public int y;
+        public int z;
+        public String kind = "death";
+        public String reportedBy;
+        public long timestampMs;
+    }
+
+    /** Result of a chunk report: always answered with a report_ack. */
+    public record ReportResult(boolean accepted, boolean duplicate, String reason) {
+        public static ReportResult ok() { return new ReportResult(true, false, ""); }
+        public static ReportResult dup() { return new ReportResult(true, true, "duplicate"); }
+        public static ReportResult reject(String why) { return new ReportResult(false, false, why); }
     }
 
     public static final class JobSummary {
@@ -216,6 +263,7 @@ public final class FleetModels {
         public int doneChunks;
         public int claimedChunks;
         public int failedChunks;
+        public String statusReason = "";
         public List<String> activeWorkers = new ArrayList<>();
     }
 
@@ -228,6 +276,7 @@ public final class FleetModels {
         public int centerZ;
         public String ownerName;
         public ChunkState state;
+        public long leaseEpoch;
     }
 
     public static final class FleetSnapshot {

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "manhattan_fleet_benchbridge",
+  "version": "${version}",
+  "name": "Manhattan Fleet Bench Bridge",
+  "description": "Test only: sets up, disturbs and checks Deming fleet scenarios on a dedicated server (server.properties key manhattan-fleet-bench). Never install it on a server you play on.",
+  "license": "MIT",
+  "environment": "server",
+  "entrypoints": {
+    "main": [
+      "dev.manhattan.fleet.bench.FleetBenchBridge"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "fabric-api": "*",
+    "minecraft": "~26.3",
+    "manhattan-fleet-server": "*"
+  }
+}
