@@ -56,6 +56,7 @@ public final class FleetServerMod implements ModInitializer {
     private int ticksSinceSnapshot;
     /** botUuid -> [window start ms, intents in window] for the path-intent rate limit. */
     private final Map<String, long[]> intentRate = new HashMap<>();
+    private final FleetWire.PacketReassembler packetReassembler = new FleetWire.PacketReassembler();
 
     /** The running instance (for the server-side benchmark bridge and tools); null before initialization. */
     public static FleetServerMod instance() {
@@ -102,6 +103,7 @@ public final class FleetServerMod implements ModInitializer {
         });
 
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
+            packetReassembler.clearAll();
             if (store != null) {
                 saveProjects();
                 store.saveNowAndFlush(manager.exportState());
@@ -113,6 +115,7 @@ public final class FleetServerMod implements ModInitializer {
             ServerPlayer player = handler.getPlayer();
             String uuid = player.getUUID().toString();
             intentRate.remove(uuid);
+            packetReassembler.clearSender(uuid);
             SleepCoordinator.SleepOrder nextSleeper = manager.disconnectBot(uuid);
             if (nextSleeper != null) {
                 sendSleepOrder(server, nextSleeper);
@@ -203,6 +206,21 @@ public final class FleetServerMod implements ModInitializer {
         long now = System.currentTimeMillis();
 
         switch (type) {
+            case FleetWire.PACKET_CHUNK -> {
+                String id = getStr(body, "id", "");
+                int idx = body.has("i") ? body.get("i").getAsInt() : -1;
+                int total = body.has("n") ? body.get("n").getAsInt() : 0;
+                boolean gz = !body.has("gz") || body.get("gz").getAsBoolean();
+                String data = getStr(body, "d", null);
+                try {
+                    String full = packetReassembler.accept(uuid, id, idx, total, gz, data);
+                    if (full != null) handlePacket(server, player, full);
+                } catch (java.io.IOException e) {
+                    LOG.warn("[Fleet] Failed to decompress chunked packet {} from {}: {}", id, name, e.toString());
+                    sendError(player, "Failed to decompress chunked message: " + e.getMessage());
+                }
+            }
+
             case FleetWire.HELLO -> {
                 ClientMode mode = parseEnum(ClientMode.class, getStr(body, "mode", "LOCAL"), ClientMode.LOCAL);
                 List<String> tags = body.has("tags") ? GSON.fromJson(body.get("tags"), STRING_LIST) : List.of();
@@ -562,18 +580,23 @@ public final class FleetServerMod implements ModInitializer {
     }
 
     private void broadcastToConnected(MinecraftServer server, String type, JsonElement body) {
-        String encoded = encodeEnvelope(type, body);
-        FleetPayload payload = new FleetPayload(encoded);
+        List<String> frames = FleetWire.frameForWire(encodeEnvelope(type, body));
+        List<FleetPayload> payloads = new java.util.ArrayList<>(frames.size());
+        for (String f : frames) payloads.add(new FleetPayload(f));
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             if (ServerPlayNetworking.canSend(player, FleetPayload.TYPE)) {
-                ServerPlayNetworking.send(player, payload);
+                for (FleetPayload p : payloads) {
+                    ServerPlayNetworking.send(player, p);
+                }
             }
         }
     }
 
     private void send(ServerPlayer player, String type, JsonElement body) {
         if (ServerPlayNetworking.canSend(player, FleetPayload.TYPE)) {
-            ServerPlayNetworking.send(player, new FleetPayload(encodeEnvelope(type, body)));
+            for (String frame : FleetWire.frameForWire(encodeEnvelope(type, body))) {
+                ServerPlayNetworking.send(player, new FleetPayload(frame));
+            }
         }
     }
 
