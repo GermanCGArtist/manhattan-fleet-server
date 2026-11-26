@@ -29,6 +29,14 @@ Needs Manhattan 2.15.0+ on every client (an older client gets a message naming b
   (4 per second per bot, never stored); deaths are shared as hazards; chest contents seen by bots are shared as stock
   with 90 s item reservations.
 - **Owner index:** claims, renewals and releases no longer scan every chunk of every job.
+- **Compressed & chunked packets (0.2.1+):** large Fleet job payloads are automatically gzip-compressed and chunked under Minecraft's 32 KB C2S packet limit.
+
+## Related Suite Mods
+
+- **[Manhattan](https://github.com/GermanCGArtist/Manhattan)** — Client automation scripting, Midtown path engine, and fleet UI
+- **[Liskov](https://github.com/GermanCGArtist/Liskov)** — Shared ImGui UI host, Drives filesystem, VCS, and `liskov:sync`
+- **[Vitruvius](https://github.com/GermanCGArtist/Vitruvius)** — Blender-style 3D schematic scene editor (`F6`)
+- **Neurath** — Transit network diagram, JourneyMap vector overlay, and Spectate mode (`N` / `V`)
 
 The wire contract lives in `src/main/java/dev/manhattan/fleet/wire/FleetWire.java` and is byte-identical with
 Manhattan's copy; `./gradlew fleetTest` compares both when the checkouts sit side by side.
