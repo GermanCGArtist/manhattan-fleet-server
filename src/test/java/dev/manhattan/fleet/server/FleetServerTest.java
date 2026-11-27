@@ -28,6 +28,8 @@ public final class FleetServerTest {
         testOneLayerLookaheadWhenTopBandClaimed();
         testPhaseSpilloverAndExplicitBarriers();
         testWorkerStopHoldReassignAndJobCancel();
+        testDynamicScalingPoolJob();
+        testDynamicScalingExplicitJob();
         passed += FleetReliabilityTest.runAll();
         System.out.println("FleetServerTest: ALL " + passed + " tests passed.");
     }
@@ -506,6 +508,117 @@ public final class FleetServerTest {
         List<String> affected = fm.cancelAllJobs();
         assertTrue(affected.contains("u1"), "cancelAllJobs must report active worker u1");
         assertTrue(fm.clearFinishedJobs() == 2, "clearFinishedJobs must remove both cancelled jobs");
+        passed++;
+    }
+
+    private static List<ChunkSpec> row(String prefix, int n) {
+        List<ChunkSpec> out = new java.util.ArrayList<>();
+        for (int i = 0; i < n; i++) out.add(new ChunkSpec(prefix + "/" + (i * 64) + ",0", i * 4, 0, i * 64, 0));
+        return out;
+    }
+
+    private static int owners(FleetManager fm, FleetJob job) {
+        java.util.Set<String> s = new java.util.HashSet<>();
+        for (ChunkEntry ce : job.chunks.values()) {
+            if (ce.ownerUuid != null && (ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE)) {
+                s.add(ce.ownerUuid);
+            }
+        }
+        return s.size();
+    }
+
+    private static void testDynamicScalingPoolJob() {
+        AtomicLong clock = new AtomicLong(12_000_000L);
+        FleetManager fm = new FleetManager(new FleetConfig(), clock::get);
+        for (int i = 1; i <= 4; i++) {
+            fm.registerBot("u" + i, "Bot" + i, ClientMode.WORKER, List.of("mine"), null, "minecraft:overworld", i * 64, 64, 0);
+        }
+        fm.registerBot("u5", "Bot5", ClientMode.WORKER, List.of("lumber"), null, "minecraft:overworld", 320, 64, 0);
+
+        AssignmentPolicy p = new AssignmentPolicy();
+        p.poolTag = "mine";
+        p.maxBots = 2;
+        p.maxDistance = 0;
+        FleetJob job = fm.submitJob("pd", "Dyn", "{}", "minecraft:overworld", p, row("d", 12), List.of(), "Admin");
+
+        assertTrue(!fm.claimWork("u1", "minecraft:overworld", 64, 64, 0, null).idle, "Bot1 claims");
+        assertTrue(!fm.claimWork("u2", "minecraft:overworld", 128, 64, 0, null).idle, "Bot2 claims");
+        assertTrue(fm.claimWork("u3", "minecraft:overworld", 192, 64, 0, null).idle, "Bot3 waits: pool full");
+
+        // Scale up: Bot3 and Bot4 join without anyone stopping.
+        assertTrue(fm.setMaxBots(job.jobId, 4), "scale up");
+        assertTrue(!fm.claimWork("u3", "minecraft:overworld", 192, 64, 0, null).idle, "Bot3 joins after scale up");
+        assertTrue(!fm.claimWork("u4", "minecraft:overworld", 256, 64, 0, null).idle, "Bot4 joins after scale up");
+        assertTrue(owners(fm, job) == 4, "four workers");
+
+        // Add a bot without the pool tag: it is allowed and the pool grows.
+        assertTrue(fm.addWorkerToJob(job.jobId, "Bot5"), "add Bot5");
+        assertTrue(job.assignment.maxBots == 5, "pool grew to 5, was " + job.assignment.maxBots);
+        assertTrue(!fm.claimWork("u5", "minecraft:overworld", 320, 64, 0, null).idle, "Bot5 joins despite tag");
+        assertTrue(owners(fm, job) == 5, "five workers");
+
+        // Remove Bot2: its chunk goes back to the queue at once and it gets nothing new from this job.
+        assertTrue(fm.removeWorkerFromJob(job.jobId, "bot2"), "Bot2 was holding a chunk");
+        assertTrue(owners(fm, job) == 4, "four workers after remove");
+        assertTrue(fm.claimWork("u2", "minecraft:overworld", 128, 64, 0, null).idle, "removed Bot2 stays off the job");
+        assertTrue(fm.verifyOwnerIndex() == null, "owner index consistent after remove");
+
+        // Scale down to 2: running bots finish their chunk, then only two keep working.
+        assertTrue(fm.setMaxBots(job.jobId, 2), "scale down");
+        assertTrue(owners(fm, job) == 4, "scale down is graceful (current chunks kept)");
+        for (String u : List.of("u1", "u3", "u4", "u5")) {
+            for (ChunkEntry ce : job.chunks.values()) {
+                if (u.equals(ce.ownerUuid) && ce.state == ChunkState.CLAIMED) {
+                    assertTrue(fm.reportChunk(u, job.jobId, ce.chunkKey, ChunkState.DONE, "", ce.leaseEpoch, null).accepted(),
+                            "report for " + u);
+                    break;
+                }
+            }
+        }
+        int working = 0;
+        for (String u : List.of("u1", "u3", "u4", "u5")) {
+            if (!fm.claimWork(u, "minecraft:overworld", 0, 64, 0, null).idle) working++;
+        }
+        assertTrue(working == 2, "only two bots get new chunks after scale down, got " + working);
+
+        // Add Bot2 back: no longer excluded.
+        assertTrue(fm.addWorkerToJob(job.jobId, "Bot2"), "re-add Bot2");
+        assertTrue(!job.assignment.excludedBots.contains("Bot2"), "Bot2 no longer excluded");
+        assertTrue(!fm.claimWork("u2", "minecraft:overworld", 128, 64, 0, null).idle, "Bot2 is back");
+        assertTrue(fm.verifyOwnerIndex() == null, "owner index consistent at the end");
+        passed++;
+    }
+
+    private static void testDynamicScalingExplicitJob() {
+        AtomicLong clock = new AtomicLong(13_000_000L);
+        FleetManager fm = new FleetManager(new FleetConfig(), clock::get);
+        fm.registerBot("u1", "Bot1", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 0, 64, 0);
+        fm.registerBot("u2", "Bot2", ClientMode.WORKER, List.of(), null, "minecraft:overworld", 64, 64, 0);
+
+        AssignmentPolicy p = new AssignmentPolicy();
+        p.mode = AssignmentMode.EXPLICIT;
+        p.explicitBots = new java.util.ArrayList<>(List.of("Bot1"));
+        FleetJob job = fm.submitJob("pe", "Exp", "{}", "minecraft:overworld", p, row("e", 6), List.of(), "Admin");
+
+        assertTrue(!fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null).idle, "Bot1 claims");
+        assertTrue(fm.claimWork("u2", "minecraft:overworld", 64, 64, 0, null).idle, "Bot2 not listed");
+
+        // A held bot that is added gets released and joins.
+        fm.stopWorker("u2", true);
+        assertTrue(fm.addWorkerToJob(job.jobId, "u2"), "add by uuid");
+        assertTrue(job.assignment.explicitBots.contains("Bot2"), "list stores the name");
+        assertTrue(!fm.bot("u2").held, "add releases the hold");
+        assertTrue(!fm.claimWork("u2", "minecraft:overworld", 64, 64, 0, null).idle, "Bot2 joins");
+
+        // Replacing the whole assignment evicts bots that are no longer listed.
+        AssignmentPolicy only2 = new AssignmentPolicy();
+        only2.mode = AssignmentMode.EXPLICIT;
+        only2.explicitBots = new java.util.ArrayList<>(List.of("Bot2"));
+        List<String> evicted = fm.updateAssignmentAndEvict(job.jobId, only2);
+        assertTrue(evicted.equals(List.of("u1")), "Bot1 evicted, got " + evicted);
+        assertTrue(fm.claimWork("u1", "minecraft:overworld", 0, 64, 0, null).idle, "Bot1 off the job");
+        assertTrue(owners(fm, job) == 1, "one worker left");
+        assertTrue(fm.verifyOwnerIndex() == null, "owner index consistent");
         passed++;
     }
 

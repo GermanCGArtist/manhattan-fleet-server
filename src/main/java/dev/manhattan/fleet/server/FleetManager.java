@@ -571,12 +571,155 @@ public final class FleetManager {
     }
 
     public boolean updateAssignment(String jobId, AssignmentPolicy policy) {
+        return updateAssignmentAndEvict(jobId, policy) != null;
+    }
+
+    /**
+     * Replaces a running job's assignment (scale up or down, add or remove bots). Bots that are no longer allowed
+     * on the job at all (dropped from the explicit list, excluded, or without the pool tag) lose their chunks of
+     * this job at once; they are returned so the caller can tell them to stop. Bots that are still allowed but
+     * over a lowered {@code maxBots} finish their current chunk and then get no new one (graceful scale-down).
+     *
+     * @return the uuids of the bots that were taken off the job, or null when the job does not exist
+     */
+    public List<String> updateAssignmentAndEvict(String jobId, AssignmentPolicy policy) {
         FleetJob job = jobs.get(jobId);
-        if (job == null || policy == null) return false;
+        if (job == null || policy == null) return null;
         policy.ensureInitialized();
         job.assignment = policy;
+        List<String> evicted = new ArrayList<>();
+        for (String uuid : new ArrayList<>(owned.keySet())) {
+            BotRecord bot = bots.get(uuid);
+            if (bot != null && isBotAllowedOnJob(bot, job)) continue;
+            boolean any = false;
+            for (OwnedRef r : ownedBy(uuid)) {
+                if (r.job() != job) continue;
+                clearChunkOwner(job, r.ce(), ChunkState.PENDING);
+                any = true;
+            }
+            if (any) {
+                evicted.add(uuid);
+                if (bot != null) {
+                    bot.activeChunkKey = null;
+                    if ("WORKING".equals(bot.phase)) bot.phase = "IDLE";
+                }
+            }
+        }
+        for (BotRecord bot : bots.values()) {
+            if (jobId.equals(bot.activeJobId) && !isBotAllowedOnJob(bot, job)) bot.activeJobId = null;
+        }
+        dirty = true;
+        return evicted;
+    }
+
+    /** Finds a known bot by uuid or (case-insensitive) name. */
+    public BotRecord findBot(String nameOrUuid) {
+        if (nameOrUuid == null || nameOrUuid.isBlank()) return null;
+        BotRecord byUuid = bots.get(nameOrUuid);
+        if (byUuid != null) return byUuid;
+        for (BotRecord b : bots.values()) {
+            if (b.name != null && b.name.equalsIgnoreCase(nameOrUuid)) return b;
+        }
+        return null;
+    }
+
+    /** Sets how many bots may work on an AUTO_POOL job at once. Lowering it drains gracefully. */
+    public boolean setMaxBots(String jobId, int maxBots) {
+        FleetJob job = jobs.get(jobId);
+        if (job == null || maxBots < 1) return false;
+        AssignmentPolicy p = copyPolicy(job.assignment);
+        p.maxBots = maxBots;
+        updateAssignmentAndEvict(jobId, p);
+        return true;
+    }
+
+    /**
+     * Adds a bot to a running job: explicit jobs get it on their list; pool jobs stop excluding it, allow it
+     * without the tag if needed, and raise {@code maxBots} when the pool is full. A held bot is released and the
+     * job becomes its preferred one; a bot busy on another job keeps its chunk and comes over when it is free.
+     * Bots that never connected can be added by name.
+     */
+    public boolean addWorkerToJob(String jobId, String nameOrUuid) {
+        FleetJob job = jobs.get(jobId);
+        if (job == null || nameOrUuid == null || nameOrUuid.isBlank()) return false;
+        BotRecord bot = findBot(nameOrUuid);
+        String ref = bot != null && bot.name != null && !bot.name.isBlank() ? bot.name : nameOrUuid;
+        AssignmentPolicy p = copyPolicy(job.assignment);
+        if (p.mode == AssignmentMode.EXPLICIT) {
+            if (!listContains(p.explicitBots, bot, nameOrUuid)) p.explicitBots.add(ref);
+        } else {
+            removeFromList(p.excludedBots, bot, nameOrUuid);
+            boolean tagged = p.poolTag.isBlank() || (bot != null && hasTag(bot, p.poolTag));
+            if (!tagged && !listContains(p.extraBots, bot, nameOrUuid)) p.extraBots.add(ref);
+            int owners = ownersOf(job, bot != null ? bot.uuid : "");
+            if (owners >= p.maxBots) p.maxBots = owners + 1;
+        }
+        updateAssignmentAndEvict(jobId, p);
+        if (bot != null) {
+            bot.held = false;
+            if ("HELD".equals(bot.phase)) bot.phase = "IDLE";
+            if (bot.activeChunkKey == null) bot.activeJobId = jobId;
+        }
         dirty = true;
         return true;
+    }
+
+    /**
+     * Takes a bot off a running job at once: its chunks of this job go back to the queue and it gets no new ones
+     * (explicit jobs drop it from the list, pool jobs exclude it). It stays free for other jobs.
+     *
+     * @return true when the bot was holding a chunk of this job (so it should be told to stop)
+     */
+    public boolean removeWorkerFromJob(String jobId, String nameOrUuid) {
+        FleetJob job = jobs.get(jobId);
+        if (job == null || nameOrUuid == null || nameOrUuid.isBlank()) return false;
+        BotRecord bot = findBot(nameOrUuid);
+        AssignmentPolicy p = copyPolicy(job.assignment);
+        removeFromList(p.explicitBots, bot, nameOrUuid);
+        removeFromList(p.extraBots, bot, nameOrUuid);
+        if (p.mode == AssignmentMode.AUTO_POOL && !listContains(p.excludedBots, bot, nameOrUuid)) {
+            p.excludedBots.add(bot != null && bot.name != null && !bot.name.isBlank() ? bot.name : nameOrUuid);
+        }
+        List<String> evicted = updateAssignmentAndEvict(jobId, p);
+        return bot != null && evicted != null && evicted.contains(bot.uuid);
+    }
+
+    private static AssignmentPolicy copyPolicy(AssignmentPolicy src) {
+        AssignmentPolicy p = new AssignmentPolicy();
+        if (src != null) {
+            src.ensureInitialized();
+            p.mode = src.mode;
+            p.explicitBots = new ArrayList<>(src.explicitBots);
+            p.poolTag = src.poolTag;
+            p.maxBots = src.maxBots;
+            p.maxDistance = src.maxDistance;
+            p.priority = src.priority;
+            p.extraBots = new ArrayList<>(src.extraBots);
+            p.excludedBots = new ArrayList<>(src.excludedBots);
+        }
+        p.ensureInitialized();
+        return p;
+    }
+
+    private static boolean matchesBot(String entry, BotRecord bot, String ref) {
+        if (entry == null) return false;
+        if (entry.equalsIgnoreCase(ref)) return true;
+        return bot != null && (entry.equalsIgnoreCase(bot.name) || entry.equalsIgnoreCase(bot.uuid));
+    }
+
+    private static boolean listContains(List<String> list, BotRecord bot, String ref) {
+        for (String s : list) if (matchesBot(s, bot, ref)) return true;
+        return false;
+    }
+
+    private static void removeFromList(List<String> list, BotRecord bot, String ref) {
+        list.removeIf(s -> matchesBot(s, bot, ref));
+    }
+
+    private static boolean hasTag(BotRecord bot, String tag) {
+        if (bot.tags == null) return false;
+        for (String t : bot.tags) if (tag.equalsIgnoreCase(t)) return true;
+        return false;
     }
 
     // ------------------------------------------------------------------ Chunk Claiming & Reporting
@@ -823,31 +966,21 @@ public final class FleetManager {
     // ------------------------------------------------------------------ Internals
 
     private boolean isBotEligibleForJob(BotRecord bot, FleetJob job) {
-        AssignmentPolicy p = job.assignment;
-        if (p.mode == AssignmentMode.EXPLICIT) {
-            for (String target : p.explicitBots) {
-                if (target == null) continue;
-                if (target.equalsIgnoreCase(bot.name) || target.equalsIgnoreCase(bot.uuid)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        // AUTO_POOL mode
-        if (p.poolTag != null && !p.poolTag.isBlank()) {
-            boolean hasTag = false;
-            for (String tag : bot.tags) {
-                if (p.poolTag.equalsIgnoreCase(tag)) {
-                    hasTag = true;
-                    break;
-                }
-            }
-            if (!hasTag) return false;
-        }
-
+        if (!isBotAllowedOnJob(bot, job)) return false;
+        if (job.assignment.mode == AssignmentMode.EXPLICIT) return true;
         // Enforce maxBots (distinct active/grace owners other than this bot).
-        return ownersOf(job, bot.uuid) < p.maxBots;
+        return ownersOf(job, bot.uuid) < job.assignment.maxBots;
+    }
+
+    /** Whether the job's assignment lets this bot work on it at all (ignores maxBots). */
+    private boolean isBotAllowedOnJob(BotRecord bot, FleetJob job) {
+        AssignmentPolicy p = job.assignment;
+        p.ensureInitialized();
+        if (p.mode == AssignmentMode.EXPLICIT) return listContains(p.explicitBots, bot, bot.uuid);
+        // AUTO_POOL mode
+        if (listContains(p.excludedBots, bot, bot.uuid)) return false;
+        if (listContains(p.extraBots, bot, bot.uuid)) return true;
+        return p.poolTag == null || p.poolTag.isBlank() || hasTag(bot, p.poolTag);
     }
 
     private ChunkEntry pickChunkForBot(BotRecord bot, FleetJob job, long nowMs) {

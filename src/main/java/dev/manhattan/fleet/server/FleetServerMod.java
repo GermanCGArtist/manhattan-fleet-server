@@ -6,6 +6,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.reflect.TypeToken;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import dev.manhattan.fleet.server.FleetModels.*;
 import dev.manhattan.fleet.wire.FleetWire;
@@ -301,7 +302,23 @@ public final class FleetServerMod implements ModInitializer {
                     case "reassign" -> {
                         if (body.has("assignment")) {
                             AssignmentPolicy p = GSON.fromJson(body.get("assignment"), AssignmentPolicy.class);
-                            manager.updateAssignment(jobId, p);
+                            List<String> evicted = manager.updateAssignmentAndEvict(jobId, p);
+                            if (evicted != null) {
+                                for (String botUuid : evicted) {
+                                    sendWorkerStop(server, botUuid, jobId, "Removed from " + jobId + " by " + name);
+                                }
+                            }
+                        }
+                    }
+                    case "scale" -> manager.setMaxBots(jobId, body.has("maxBots") ? body.get("maxBots").getAsInt() : 0);
+                    case "add_worker" -> manager.addWorkerToJob(jobId, getStr(body, "bot", ""));
+                    case "remove_worker" -> {
+                        String bot = getStr(body, "bot", "");
+                        if (manager.removeWorkerFromJob(jobId, bot)) {
+                            BotRecord rec = manager.findBot(bot);
+                            if (rec != null) {
+                                sendWorkerStop(server, rec.uuid, jobId, "Removed from " + jobId + " by " + name);
+                            }
                         }
                     }
                     default -> {}
@@ -649,6 +666,83 @@ public final class FleetServerMod implements ModInitializer {
                             String id = StringArgumentType.getString(ctx, "jobId");
                             boolean ok = manager.cancelJob(id);
                             ctx.getSource().sendSuccess(() -> Component.literal(ok ? "[Fleet] Cancelled " + id : "[Fleet] Could not cancel " + id), false);
+                            return ok ? 1 : 0;
+                        })))
+                .then(Commands.literal("workers").executes(ctx -> {
+                    FleetSnapshot snap = manager.snapshot();
+                    if (snap.bots.isEmpty()) {
+                        ctx.getSource().sendSuccess(() -> Component.literal("[Fleet] No fleet clients known."), false);
+                        return 0;
+                    }
+                    for (BotRecord b : snap.bots) {
+                        String line = "[Fleet] " + b.name + " [" + b.mode + "] " + (b.online ? "online" : "offline")
+                                + (b.held ? ", HELD" : "")
+                                + (b.activeJobId != null ? ", " + b.activeJobId
+                                        + (b.activeChunkKey != null ? " (" + b.activeChunkKey + ")" : "") : "");
+                        ctx.getSource().sendSuccess(() -> Component.literal(line), false);
+                    }
+                    return snap.bots.size();
+                }))
+                .then(Commands.literal("scale")
+                        .then(Commands.argument("jobId", StringArgumentType.word())
+                                .then(Commands.argument("maxBots", IntegerArgumentType.integer(1, 256)).executes(ctx -> {
+                                    String id = StringArgumentType.getString(ctx, "jobId");
+                                    int n = IntegerArgumentType.getInteger(ctx, "maxBots");
+                                    boolean ok = manager.setMaxBots(id, n);
+                                    snapshotDirty = true;
+                                    ctx.getSource().sendSuccess(() -> Component.literal(ok
+                                            ? "[Fleet] " + id + " now takes up to " + n + " bot(s); extra bots finish their chunk first."
+                                            : "[Fleet] Unknown job " + id), false);
+                                    return ok ? 1 : 0;
+                                }))))
+                .then(Commands.literal("add")
+                        .then(Commands.argument("jobId", StringArgumentType.word())
+                                .then(Commands.argument("bot", StringArgumentType.word()).executes(ctx -> {
+                                    String id = StringArgumentType.getString(ctx, "jobId");
+                                    String bot = StringArgumentType.getString(ctx, "bot");
+                                    boolean ok = manager.addWorkerToJob(id, bot);
+                                    snapshotDirty = true;
+                                    ctx.getSource().sendSuccess(() -> Component.literal(ok
+                                            ? "[Fleet] Added " + bot + " to " + id
+                                            : "[Fleet] Unknown job " + id), false);
+                                    return ok ? 1 : 0;
+                                }))))
+                .then(Commands.literal("remove")
+                        .then(Commands.argument("jobId", StringArgumentType.word())
+                                .then(Commands.argument("bot", StringArgumentType.word()).executes(ctx -> {
+                                    String id = StringArgumentType.getString(ctx, "jobId");
+                                    String bot = StringArgumentType.getString(ctx, "bot");
+                                    if (manager.jobsView().get(id) == null) {
+                                        ctx.getSource().sendSuccess(() -> Component.literal("[Fleet] Unknown job " + id), false);
+                                        return 0;
+                                    }
+                                    if (manager.removeWorkerFromJob(id, bot)) {
+                                        BotRecord rec = manager.findBot(bot);
+                                        if (rec != null) {
+                                            sendWorkerStop(ctx.getSource().getServer(), rec.uuid, id, "Removed from " + id + " by an admin");
+                                        }
+                                    }
+                                    snapshotDirty = true;
+                                    ctx.getSource().sendSuccess(() -> Component.literal("[Fleet] Removed " + bot + " from " + id), false);
+                                    return 1;
+                                }))))
+                .then(Commands.literal("hold")
+                        .then(Commands.argument("bot", StringArgumentType.word()).executes(ctx -> {
+                            String bot = StringArgumentType.getString(ctx, "bot");
+                            BotRecord rec = manager.findBot(bot);
+                            boolean ok = rec != null && manager.stopWorker(rec.uuid, true);
+                            if (ok) sendWorkerStop(ctx.getSource().getServer(), rec.uuid, "", "Stopped & held by an admin");
+                            snapshotDirty = true;
+                            ctx.getSource().sendSuccess(() -> Component.literal(ok ? "[Fleet] Holding " + bot : "[Fleet] Unknown bot " + bot), false);
+                            return ok ? 1 : 0;
+                        })))
+                .then(Commands.literal("unhold")
+                        .then(Commands.argument("bot", StringArgumentType.word()).executes(ctx -> {
+                            String bot = StringArgumentType.getString(ctx, "bot");
+                            BotRecord rec = manager.findBot(bot);
+                            boolean ok = rec != null && manager.resumeWorker(rec.uuid);
+                            snapshotDirty = true;
+                            ctx.getSource().sendSuccess(() -> Component.literal(ok ? "[Fleet] " + bot + " is back in the pool" : "[Fleet] Unknown bot " + bot), false);
                             return ok ? 1 : 0;
                         })))
                 .then(Commands.literal("reload").executes(ctx -> {

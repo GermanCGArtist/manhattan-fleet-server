@@ -54,10 +54,16 @@ public final class FleetModels {
         public int maxBots = 2;
         public int maxDistance = 500;
         public int priority = 0;
+        /** AUTO_POOL: bots (name or uuid) allowed on the job even without the pool tag. */
+        public List<String> extraBots = new ArrayList<>();
+        /** AUTO_POOL: bots (name or uuid) never given chunks of this job, even with the pool tag. */
+        public List<String> excludedBots = new ArrayList<>();
 
         public void ensureInitialized() {
             if (mode == null) mode = AssignmentMode.AUTO_POOL;
             if (explicitBots == null) explicitBots = new ArrayList<>();
+            if (extraBots == null) extraBots = new ArrayList<>();
+            if (excludedBots == null) excludedBots = new ArrayList<>();
             if (poolTag == null) poolTag = "";
             if (maxBots < 1) maxBots = 1;
             if (maxDistance < 0) maxDistance = 0;

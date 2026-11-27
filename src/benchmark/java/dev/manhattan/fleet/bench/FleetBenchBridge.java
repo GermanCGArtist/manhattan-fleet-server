@@ -54,12 +54,14 @@ public final class FleetBenchBridge implements ModInitializer {
         int[] clear9 = {8, -60, 8, 55, -58, 55};      // 48 x 48 x 3: 9 chunks of 16
         int[] clear16 = {8, -60, 8, 71, -59, 71};     // 64 x 64 x 2: 16 chunks
         int[] east4 = {24, -60, -16, 55, -59, 15};    // 32 x 32 x 2 east of the pen: 4 chunks
+        int[] clear25 = {8, -60, 8, 87, -59, 87};     // 80 x 80 x 2: 25 chunks (enough work to scale mid-job)
         return switch (name) {
             case "fleet_clear_4" -> new Scenario(name, 4, clear9, "", "", 900, false);
             case "fleet_clear_8" -> new Scenario(name, 8, clear16, "", "", 900, false);
             case "fleet_kick_4" -> new Scenario(name, 4, clear9, "kick", "FBWorker2", 1200, false);
             case "fleet_death_4" -> new Scenario(name, 4, clear9, "kill", "FBWorker1", 1200, false);
             case "fleet_doorway_4" -> new Scenario(name, 4, east4, "", "", 900, true);
+            case "fleet_scale_4" -> new Scenario(name, 4, clear25, "scale", "FBWorker2", 1500, false);
             default -> null;
         };
     }
@@ -76,6 +78,12 @@ public final class FleetBenchBridge implements ModInitializer {
     private long resultSaidMs;
     private int resultRepeats;
     private final Set<String> equipped = new HashSet<>();
+    /** fleet_scale_4: 0 = running, 1 = target removed, 2 = scaled down to 2, 3 = re-added and scaled up to 4. */
+    private int scalePhase;
+    private long scalePhaseMs;
+    private int prevOwners = -1;
+    private boolean targetBackOnJob;
+    private final List<String> scaleProblems = new ArrayList<>();
     /** Players to set up, with the tick they joined (set up 2 s later, once they are fully in the world). */
     private final java.util.Map<String, Integer> pendingSetup = new java.util.LinkedHashMap<>();
 
@@ -244,6 +252,7 @@ public final class FleetBenchBridge implements ModInitializer {
                 run(server, "kill " + target);
             }
         }
+        if ("scale".equals(sc.chaos())) scaleStep(server, fm, job, now, elapsed);
         if (elapsed % 30 == 0) {
             int done = 0, claimed = 0;
             for (ChunkEntry ce : job.chunks.values()) {
@@ -268,11 +277,76 @@ public final class FleetBenchBridge implements ModInitializer {
             if (ce.doneCount > 1) doneTwice++;
         }
         if (doneTwice > 0) problems.add(doneTwice + " chunk(s) marked DONE more than once");
+        if ("scale".equals(sc.chaos())) {
+            if (scalePhase < 3) problems.add("job ended in scale phase " + scalePhase + " (not enough work to test scaling)");
+            else if (!targetBackOnJob) problems.add(sc.chaosTarget() + " never got a chunk after it was added back");
+            problems.addAll(scaleProblems);
+        }
         int solid = solidInBox(server);
         if (solid > 0) problems.add(solid + " block(s) still in the box");
         String detail = String.format(Locale.ROOT, "chunks=%d secs=%d bots=%d %s", job.chunks.size(), elapsed,
                 sc.bots(), problems.isEmpty() ? "ok" : String.join("; ", problems));
         finish(server, problems.isEmpty(), detail);
+    }
+
+    /** Owners of the job's live leases (CLAIMED or in rejoin grace), by name. */
+    private static Set<String> ownerNames(FleetJob job) {
+        Set<String> out = new HashSet<>();
+        for (ChunkEntry ce : job.chunks.values()) {
+            if (ce.ownerName != null && (ce.state == ChunkState.CLAIMED || ce.state == ChunkState.DISCONNECTED_GRACE)) {
+                out.add(ce.ownerName);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * fleet_scale_4, once a second: 20 s in, remove the target with {@code /fleet remove} (its chunk must go back at
+     * once and it must get none while removed); 40 s in, {@code /fleet scale} to 2 (no new lease may push the job
+     * above 2 bots, the extra ones only finish their chunk); once at most 2 bots work (or 150 s in), add the target
+     * back and scale to 4 (it must get a chunk again).
+     */
+    private void scaleStep(MinecraftServer server, FleetManager fm, FleetJob job, long now, long elapsed) {
+        String target = sc.chaosTarget();
+        Set<String> owners = ownerNames(job);
+        int n = owners.size();
+        if (scalePhase == 0 && elapsed >= 20) {
+            LOG.info("[FleetBench] SCALE: removing {} (owners {})", target, owners);
+            run(server, "fleet remove " + jobId + " " + target);
+            scalePhase = 1;
+            scalePhaseMs = now;
+            Set<String> after = ownerNames(job);
+            if (after.contains(target)) scaleProblems.add(target + " kept its chunk after /fleet remove");
+            n = after.size();
+        } else if (scalePhase >= 1 && scalePhase < 3 && owners.contains(target)) {
+            scaleProblems.add(target + " got a chunk while removed (t+" + elapsed + "s)");
+        }
+        if (scalePhase == 1 && elapsed >= 40) {
+            LOG.info("[FleetBench] SCALE: max bots -> 2 (owners {})", owners);
+            run(server, "fleet scale " + jobId + " 2");
+            scalePhase = 2;
+            scalePhaseMs = now;
+            prevOwners = n;
+        } else if (scalePhase == 2) {
+            if (n > 2 && n > prevOwners) {
+                scaleProblems.add("owners rose to " + n + " after scaling down to 2 (t+" + elapsed + "s)");
+            }
+            prevOwners = n;
+            if (n <= 2 || elapsed >= 150) {
+                LOG.info("[FleetBench] SCALE: down to {} bot(s) {} s after the scale-down; adding {} back, max bots -> 4",
+                        n, (now - scalePhaseMs) / 1000L, target);
+                if (n > 2) scaleProblems.add("still " + n + " bots 110 s after scaling down to 2");
+                run(server, "fleet add " + jobId + " " + target);
+                run(server, "fleet scale " + jobId + " 4");
+                scalePhase = 3;
+                scalePhaseMs = now;
+            }
+        } else if (scalePhase == 3 && !targetBackOnJob && owners.contains(target)) {
+            targetBackOnJob = true;
+            LOG.info("[FleetBench] SCALE: {} is back on the job after {} s (owners {})", target,
+                    (now - scalePhaseMs) / 1000L, owners);
+        }
+        if (elapsed % 10 == 0) LOG.info("[FleetBench] SCALE t+{}s phase {} owners {}", elapsed, scalePhase, owners);
     }
 
     private void finish(MinecraftServer server, boolean pass, String detail) {

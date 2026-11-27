@@ -10,7 +10,12 @@ A lean, coordination-only server-side Fabric companion mod for [Manhattan](https
 - **Lease-based chunk distribution:** 1-chunk spatial separation between active workers, 60 s rejoin grace window on disconnect (with automatic preemption when idle peers have no other work), and instant release on death.
 - **Coordinated 1-player sleeping:** Picks the single worker nearest its bed (personal or site `bedPool`) while all other bots keep working, with automatic failover if the chosen sleeper fails or disconnects.
 - **Shared chest sync & locks:** Propagates client-reported empty/full chest state and enforces short 1-bot-per-chest locks.
-- **Server commands:** `/fleet status`, `/fleet pause <jobId>`, `/fleet resume <jobId>`, `/fleet cancel <jobId>`, `/fleet reload`.
+- **Dynamic scaling (0.2.2+):** add or remove workers and change a job's `maxBots` while it runs. New Worker-mode
+  bots join on their own; a removed bot's chunk goes straight back to the queue; lowering `maxBots` lets the extra
+  bots finish their current chunk first.
+- **Server commands:** `/fleet status`, `/fleet workers`, `/fleet pause|resume|cancel <jobId>`,
+  `/fleet scale <jobId> <maxBots>`, `/fleet add <jobId> <bot>`, `/fleet remove <jobId> <bot>`,
+  `/fleet hold <bot>`, `/fleet unhold <bot>`, `/fleet reload`.
 
 ## Reliability (protocol v2, 0.2.0+)
 
